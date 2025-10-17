@@ -1,19 +1,18 @@
 import math
 from bisect import bisect_left
-from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 import cv2
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from ..models import Point2D
-from ..settings import AppSettings, SettingsManager, get_settings_path
-from ..tracking import CustomPointTracker
-from ..tracking.custom_points import CustomPointFrameResult
-from ..video import VideoPlayer
-from .video_widget import VideoContainer
+from ..model import AppSettings, Point2D, SettingsManager
+from ..model.tracking.custom_points import CustomPointFrameResult
 from .settings_dialog import SettingsDialog
+from .video_widget import VideoContainer
 from .timeline import DetailedTimeline, OverviewTimeline, clamp
+
+if TYPE_CHECKING:  # pragma: no cover - for static analysis only
+    from ..controller import SwingTrackerController
 
 
 class OffFrameDialog(QtWidgets.QDialog):
@@ -170,39 +169,15 @@ class OffFrameDialog(QtWidgets.QDialog):
 
 
 class SwingTrackerWindow(QtWidgets.QMainWindow):
-    POINT_DEFINITIONS: Dict[str, Tuple[int, int, int]] = {
-        "Golf Ball": (255, 255, 0),
-        "Club Handle": (255, 64, 64),
-        "Club Midpoint": (64, 200, 64),
-        "Club Toe": (64, 128, 255),
-        "Club Heel": (255, 200, 64),
-    }
-
-    def __init__(self) -> None:
+    def __init__(self, controller: "SwingTrackerController") -> None:
         super().__init__()
+        self.controller = controller
+        self.controller.set_view(self)
+
         self.setWindowTitle("Swing Tracker")
         self.resize(1440, 840)
 
-        root_path = Path(__file__).resolve().parents[2]
-        self.settings_manager = SettingsManager(get_settings_path(root_path))
-        self.settings: AppSettings = self.settings_manager.settings
-        self.auto_tracking_enabled: bool = self.settings.general.auto_track
-
-        self.video_player = VideoPlayer()
-        self.custom_tracker = CustomPointTracker()
-        self.custom_tracker.update_from_settings(self.settings.tracking)
-        self.current_frame_bgr: Optional[cv2.typing.MatLike] = None
-
-        self.preprocessed_custom_results: Dict[int, CustomPointFrameResult] = {}
-        self.use_preprocessed_results: bool = False
-
-        self.active_point: Optional[str] = None
         self.issues_collapsed: bool = False
-        self.viewport_range: Tuple[float, float] = (
-            self.settings.general.viewport_start,
-            self.settings.general.viewport_end,
-        )
-        self.auto_tracking_enabled: bool = self.settings.general.auto_track
 
         self._build_ui()
         self._setup_connections()
@@ -217,6 +192,81 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
 
         self.playback_timer = QtCore.QTimer(self)
         self.playback_timer.timeout.connect(self._next_frame)
+
+    # ------------------------------------------------------------------
+    # Model-backed properties
+    # ------------------------------------------------------------------
+    @property
+    def settings_manager(self) -> SettingsManager:
+        return self.controller.settings_manager
+
+    @property
+    def settings(self) -> AppSettings:
+        return self.controller.settings
+
+    @settings.setter
+    def settings(self, value: AppSettings) -> None:
+        self.controller.settings = value
+
+    @property
+    def auto_tracking_enabled(self) -> bool:
+        return self.controller.auto_tracking_enabled
+
+    @auto_tracking_enabled.setter
+    def auto_tracking_enabled(self, value: bool) -> None:
+        self.controller.auto_tracking_enabled = value
+
+    @property
+    def video_player(self):  # type: ignore[override]
+        return self.controller.video_player
+
+    @property
+    def custom_tracker(self):  # type: ignore[override]
+        return self.controller.custom_tracker
+
+    @property
+    def current_frame_bgr(self):  # type: ignore[override]
+        return self.controller.current_frame_bgr
+
+    @current_frame_bgr.setter
+    def current_frame_bgr(self, value) -> None:  # type: ignore[override]
+        self.controller.current_frame_bgr = value
+
+    @property
+    def preprocessed_custom_results(self):  # type: ignore[override]
+        return self.controller.preprocessed_custom_results
+
+    @preprocessed_custom_results.setter
+    def preprocessed_custom_results(self, value):  # type: ignore[override]
+        self.controller.preprocessed_custom_results = value
+
+    @property
+    def use_preprocessed_results(self) -> bool:
+        return self.controller.use_preprocessed_results
+
+    @use_preprocessed_results.setter
+    def use_preprocessed_results(self, value: bool) -> None:
+        self.controller.use_preprocessed_results = value
+
+    @property
+    def active_point(self) -> Optional[str]:
+        return self.controller.active_point
+
+    @active_point.setter
+    def active_point(self, value: Optional[str]) -> None:
+        self.controller.active_point = value
+
+    @property
+    def viewport_range(self) -> Tuple[float, float]:
+        return self.controller.viewport_range
+
+    @viewport_range.setter
+    def viewport_range(self, value: Tuple[float, float]) -> None:
+        self.controller.viewport_range = value
+
+    @property
+    def point_definitions(self) -> Dict[str, Tuple[int, int, int]]:
+        return self.controller.point_definitions
 
     # ------------------------------------------------------------------
     # UI construction
@@ -352,7 +402,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         layout.addLayout(header)
 
         self.point_rows: Dict[str, Dict[str, QtWidgets.QWidget]] = {}
-        for name, color in self.POINT_DEFINITIONS.items():
+        for name, color in self.point_definitions.items():
             row_widget = QtWidgets.QFrame()
             row_widget.setObjectName("pointRow")
             row_widget.setStyleSheet(
@@ -1062,7 +1112,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             self._update_timeline_markers()
             return
 
-        for point_name in self.POINT_DEFINITIONS.keys():
+        for point_name in self.point_definitions.keys():
             frames = pending.get(point_name)
             if not frames:
                 continue
@@ -1082,7 +1132,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             row_layout.setContentsMargins(10, 6, 10, 6)
             row_layout.setSpacing(8)
 
-            color = self.POINT_DEFINITIONS.get(point_name, (255, 255, 255))
+            color = self.point_definitions.get(point_name, (255, 255, 255))
             indicator = QtWidgets.QLabel()
             indicator.setFixedSize(10, 10)
             indicator.setStyleSheet(f"background-color: rgb({color[0]}, {color[1]}, {color[2]}); border-radius: 5px;")
@@ -1181,7 +1231,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
     # Interactions
     # ------------------------------------------------------------------
     def _set_active_point(self, point_name: str) -> None:
-        if point_name not in self.POINT_DEFINITIONS:
+        if point_name not in self.point_definitions:
             return
         self.active_point = point_name
         self._refresh_point_statuses()
@@ -1359,7 +1409,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         if not self.video_player.is_loaded():
             return
         if self.active_point is None:
-            self._set_active_point(next(iter(self.POINT_DEFINITIONS)))
+            self._set_active_point(next(iter(self.point_definitions)))
         if self.playback_timer.isActive():
             self.playback_timer.stop()
             self._update_play_button(False)
@@ -1442,9 +1492,9 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
     # Utility helpers
     # ------------------------------------------------------------------
     def _initialize_points(self) -> None:
-        self.custom_tracker.configure_points(self.POINT_DEFINITIONS)
-        if self.active_point not in self.POINT_DEFINITIONS:
-            self.active_point = next(iter(self.POINT_DEFINITIONS))
+        self.custom_tracker.configure_points(self.point_definitions)
+        if self.active_point not in self.point_definitions:
+            self.active_point = next(iter(self.point_definitions))
         self._refresh_point_statuses()
         self._update_timeline_absences()
         self._update_timeline_markers()

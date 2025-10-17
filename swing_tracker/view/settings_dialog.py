@@ -5,7 +5,7 @@ from typing import Dict, Optional
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from ..settings import (
+from ..model import (
     AppSettings,
     DataSettings,
     GeneralSettings,
