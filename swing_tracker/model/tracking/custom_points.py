@@ -3,9 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
-import cv2
-import numpy as np
-
 from ..entities import Point2D, TrackIssue, TrackedPoint
 from ..settings import TrackingSettings
 from .provisional import AnchorMetrics, ProvisionalChain, build_provisional_chain
@@ -19,24 +16,10 @@ class CustomPointFrameResult:
 
 
 class CustomPointTracker:
-    def __init__(
-        self,
-        smoothing_alpha: float = 0.2,
-        deviation_threshold: float = 18.0,
-        max_history_frames: int = 200,
-    ) -> None:
-        self.smoothing_alpha = smoothing_alpha
-        self.deviation_threshold = deviation_threshold
+    def __init__(self, max_history_frames: int = 200) -> None:
         self.max_history_frames = max_history_frames
-        self.lk_params = dict(
-            winSize=(21, 21),
-            maxLevel=3,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
-        )
         self.points: Dict[str, TrackedPoint] = {}
         self.current_positions: Dict[str, Point2D] = {}
-        self.prev_gray: Optional[np.ndarray] = None
-        self.smoothing_enabled: bool = True
         self.truncate_future_on_manual_set: bool = True
         self.interpolation_mode: str = "linear"
         self.span_length: int = 50
@@ -59,14 +42,12 @@ class CustomPointTracker:
             for name, color in point_definitions.items()
         }
         self.current_positions.clear()
-        self.prev_gray = None
         self._reset_provisional_state()
 
     def reset(self) -> None:
         for tracked_point in self.points.values():
             tracked_point.clear()
         self.current_positions.clear()
-        self.prev_gray = None
         self._reset_provisional_state()
 
     # ------------------------------------------------------------------
@@ -271,56 +252,10 @@ class CustomPointTracker:
             changed |= self.reject_provisional(point_name, span, frame)
         return changed
 
-    def process_frame(self, frame_bgr: np.ndarray, frame_index: int, record: bool) -> CustomPointFrameResult:
-        height, width = frame_bgr.shape[:2]
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-
+    def process_frame(self, frame_bgr, frame_index: int, record: bool) -> CustomPointFrameResult:
         issues: List[TrackIssue] = []
         resolved: Set[str] = set()
         new_positions: Dict[str, Point2D] = {}
-
-        flow_results: Dict[str, Optional[Point2D]] = {}
-        flow_fb_errors: Dict[str, Optional[float]] = {}
-        if record and self.prev_gray is not None and self.current_positions:
-            prev_items = list(self.current_positions.items())
-            prev_points = np.array([pos for _, pos in prev_items], dtype=np.float32).reshape(-1, 1, 2)
-            next_points, status, errors = cv2.calcOpticalFlowPyrLK(
-                self.prev_gray,
-                gray,
-                prev_points,
-                None,
-                **self.lk_params,
-            )
-            back_points = None
-            back_status = None
-            if next_points is not None:
-                back_points, back_status, _ = cv2.calcOpticalFlowPyrLK(
-                    gray,
-                    self.prev_gray,
-                    next_points,
-                    None,
-                    **self.lk_params,
-                )
-
-            for idx, (point_name, prev_pos) in enumerate(prev_items):
-                fb_error_value: Optional[float] = None
-                if status[idx] == 1:
-                    x, y = next_points[idx][0]
-                    if 0 <= x < width and 0 <= y < height:
-                        flow_results[point_name] = (float(x), float(y))
-                        if (
-                            back_points is not None
-                            and back_status is not None
-                            and back_status[idx] == 1
-                        ):
-                            back_pos = back_points[idx][0]
-                            diff_x = float(prev_points[idx][0][0] - back_pos[0])
-                            diff_y = float(prev_points[idx][0][1] - back_pos[1])
-                            fb_error_value = float(np.hypot(diff_x, diff_y))
-                        flow_fb_errors[point_name] = fb_error_value
-                        continue
-                flow_results[point_name] = None
-                flow_fb_errors[point_name] = None
 
         for point_name, tracked_point in self.points.items():
             if not tracked_point.keyframes:
@@ -334,56 +269,16 @@ class CustomPointTracker:
                 tracked_point.smoothed_position = None
                 tracked_point.last_frame_index = frame_index
                 continue
+
             expected = self._expected_position(tracked_point, frame_index)
-            flow_pos = flow_results.get(point_name) if flow_results else None
-            smoothed = self._compute_smoothed_position(tracked_point, flow_pos, expected)
+            if expected is None:
+                continue
 
-            if smoothed is not None:
-                if record:
-                    tracked_point.record(
-                        frame_index,
-                        smoothed,
-                        1.0,
-                        fb_error=flow_fb_errors.get(point_name),
-                    )
-                    self._trim_history(tracked_point, frame_index)
-                new_positions[point_name] = smoothed
-                tracked_point.smoothed_position = smoothed
-                tracked_point.last_frame_index = frame_index
-            else:
-                prior = tracked_point.positions.get(frame_index) or expected
-                if prior is not None:
-                    new_positions[point_name] = prior
-
-            deviation = None
-            if record and smoothed is not None and expected is not None:
-                deviation = self._distance(smoothed, expected)
-                if deviation <= self.deviation_threshold:
-                    resolved.add(point_name)
-                else:
-                    issues.append(
-                        TrackIssue(
-                            frame_index=frame_index,
-                            point_name=point_name,
-                            confidence=max(0.0, 1.0 - (deviation / (self.deviation_threshold * 2))),
-                            note="Tracking drift detected; please update point.",
-                        )
-                    )
-            elif record and flow_pos is None:
-                issues.append(
-                    TrackIssue(
-                        frame_index=frame_index,
-                        point_name=point_name,
-                        confidence=0.0,
-                        note="Unable to track point; awaiting manual correction.",
-                    )
-                )
+            new_positions[point_name] = expected
+            tracked_point.smoothed_position = expected
+            tracked_point.last_frame_index = frame_index
 
         self.current_positions = new_positions
-        self.prev_gray = gray
-
-        if record:
-            self._invalidate_point_cache()
 
         return CustomPointFrameResult(
             positions=new_positions,
@@ -405,7 +300,6 @@ class CustomPointTracker:
         tracked_point.smoothed_position = position
         tracked_point.last_frame_index = frame_index
         self.current_positions[point_name] = position
-        self.prev_gray = None
         self._invalidate_point_cache(point_name)
 
     def clear_point_history(self, point_name: str) -> None:
@@ -413,7 +307,6 @@ class CustomPointTracker:
             return
         self.points[point_name].clear()
         self.current_positions.pop(point_name, None)
-        self.prev_gray = None
         self._invalidate_point_cache(point_name)
 
     def mark_point_absent(self, point_name: str, start_frame: int, end_frame: int) -> None:
@@ -468,7 +361,6 @@ class CustomPointTracker:
             tracked_point.remove_absence_at(frame_index)
             tracked_point.truncate_after(frame_index - 1)
             self.current_positions.pop(point_name, None)
-            self.prev_gray = None
             self._invalidate_point_cache(point_name)
             return True
 
@@ -483,7 +375,6 @@ class CustomPointTracker:
         tracked_point.open_absence_start = None
         tracked_point.end_absence_at(frame_index)
         self.current_positions.pop(point_name, None)
-        self.prev_gray = None
         self._invalidate_point_cache(point_name)
         return True
 
@@ -553,70 +444,17 @@ class CustomPointTracker:
         
 
     def update_from_settings(self, settings: TrackingSettings) -> None:
-        self.smoothing_alpha = settings.smoothing_alpha
-        self.smoothing_enabled = settings.smoothing_enabled
-        self.deviation_threshold = settings.deviation_threshold
         self.max_history_frames = settings.history_frames
         self.truncate_future_on_manual_set = settings.truncate_future_on_manual_set
         self.interpolation_mode = settings.baseline_mode.lower()
         if self.interpolation_mode not in {"linear", "cubic", "const-velocity"}:
             self.interpolation_mode = "linear"
         self.threshold_confidence = float(max(0.0, min(1.0, settings.issue_confidence_threshold)))
-        win_size = int(max(5, settings.optical_flow_window_size))
-        if win_size % 2 == 0:
-            win_size += 1
-        self.lk_params["winSize"] = (win_size, win_size)
-        self.lk_params["maxLevel"] = int(max(1, settings.optical_flow_pyramid))
-        self.lk_params["criteria"] = (
-            cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
-            30,
-            float(max(0.001, settings.optical_flow_termination)),
-        )
         self._invalidate_point_cache()
-
-    def add_auto_keyframe(self, point_name: str, frame_index: int) -> None:
-        if point_name not in self.points:
-            return
-        tracked_point = self.points[point_name]
-        position = tracked_point.positions.get(frame_index)
-        if position is None or tracked_point.is_absent(frame_index):
-            return
-        tracked_point.set_keyframe(frame_index, position, accepted=False)
-        self._interpolate_neighbors(tracked_point, frame_index)
-        self._invalidate_point_cache(point_name)
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _compute_smoothed_position(
-        self,
-        tracked_point: TrackedPoint,
-        flow_pos: Optional[Point2D],
-        expected_pos: Optional[Point2D],
-    ) -> Optional[Point2D]:
-        if flow_pos is None and expected_pos is None:
-            return tracked_point.smoothed_position
-
-        if not self.smoothing_enabled:
-            if flow_pos is not None:
-                return flow_pos
-            return expected_pos
-
-        if expected_pos is not None and flow_pos is not None:
-            blended_x = (1 - self.smoothing_alpha) * expected_pos[0] + self.smoothing_alpha * flow_pos[0]
-            blended_y = (1 - self.smoothing_alpha) * expected_pos[1] + self.smoothing_alpha * flow_pos[1]
-            return (blended_x, blended_y)
-
-        if flow_pos is not None:
-            if tracked_point.smoothed_position is None:
-                return flow_pos
-            prev_x, prev_y = tracked_point.smoothed_position
-            new_x = (1 - self.smoothing_alpha) * prev_x + self.smoothing_alpha * flow_pos[0]
-            new_y = (1 - self.smoothing_alpha) * prev_y + self.smoothing_alpha * flow_pos[1]
-            return (new_x, new_y)
-
-        return expected_pos
-
     def _expected_position(self, tracked_point: TrackedPoint, frame_index: int) -> Optional[Point2D]:
         if tracked_point.is_absent(frame_index):
             tracked_point.interpolation_cache.pop(frame_index, None)
@@ -741,7 +579,3 @@ class CustomPointTracker:
     def _clear_cache_range(self, tracked_point: TrackedPoint, start_frame: int, end_frame: int) -> None:
         for f in range(start_frame + 1, end_frame):
             tracked_point.interpolation_cache.pop(f, None)
-
-    @staticmethod
-    def _distance(a: Point2D, b: Point2D) -> float:
-        return float(np.hypot(a[0] - b[0], a[1] - b[1]))

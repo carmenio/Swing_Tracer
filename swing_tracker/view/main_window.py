@@ -1,4 +1,3 @@
-import math
 from bisect import bisect_left
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
@@ -8,7 +7,6 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from ..model import AppSettings, Point2D, SettingsManager
 from ..model.video import VideoPlayer
 from ..model.video import VideoPlayer
-from ..model.tracking.custom_points import CustomPointFrameResult
 from .settings_dialog import SettingsDialog
 from .video_widget import VideoContainer
 from .timeline import DetailedTimeline, OverviewTimeline, TimelineMarker, clamp
@@ -295,11 +293,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._speed_actions: List[QtWidgets.QAction] = []
         self._build_ui()
         self._setup_connections()
-        self.auto_track_task: Optional[dict] = None
-        self.auto_track_timer = QtCore.QTimer(self)
-        self.auto_track_timer.setInterval(0)
-        self.auto_track_timer.timeout.connect(self._auto_track_step)
-
         self.playback_timer = QtCore.QTimer(self)
         self.playback_timer.setTimerType(QtCore.Qt.PreciseTimer)
         self.playback_timer.timeout.connect(self._next_frame)
@@ -340,14 +333,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self.controller.settings = value
 
     @property
-    def auto_tracking_enabled(self) -> bool:
-        return self.controller.auto_tracking_enabled
-
-    @auto_tracking_enabled.setter
-    def auto_tracking_enabled(self, value: bool) -> None:
-        self.controller.auto_tracking_enabled = value
-
-    @property
     def video_player(self):  # type: ignore[override]
         return self.controller.video_player
 
@@ -362,22 +347,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
     @current_frame_bgr.setter
     def current_frame_bgr(self, value) -> None:  # type: ignore[override]
         self.controller.current_frame_bgr = value
-
-    @property
-    def preprocessed_custom_results(self):  # type: ignore[override]
-        return self.controller.preprocessed_custom_results
-
-    @preprocessed_custom_results.setter
-    def preprocessed_custom_results(self, value):  # type: ignore[override]
-        self.controller.preprocessed_custom_results = value
-
-    @property
-    def use_preprocessed_results(self) -> bool:
-        return self.controller.use_preprocessed_results
-
-    @use_preprocessed_results.setter
-    def use_preprocessed_results(self, value: bool) -> None:
-        self.controller.use_preprocessed_results = value
 
     @property
     def active_point(self) -> Optional[str]:
@@ -431,11 +400,8 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         header_layout.addStretch(1)
 
         self.load_button = self._build_primary_button("Load Video", "background-color: #1f1f1f;")
-        self.preprocess_button = self._build_primary_button("Preprocess", "background-color: #1f1f1f;")
-        self.preprocess_button.setEnabled(False)
         self.settings_button = self._build_primary_button("Settings", "background-color: #1f1f1f;")
         header_layout.addWidget(self.load_button)
-        header_layout.addWidget(self.preprocess_button)
         header_layout.addWidget(self.settings_button)
         main_layout.addLayout(header_layout)
 
@@ -836,7 +802,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
 
     def _setup_connections(self) -> None:
         self.load_button.clicked.connect(self.load_video)
-        self.preprocess_button.clicked.connect(self._preprocess_video)
 
         self.play_toggle.clicked.connect(self.toggle_playback)
 
@@ -935,8 +900,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Error", "Failed to open video.")
             return
 
-        self._invalidate_preprocessing()
-
         self.viewport_range = (
             self.settings.general.viewport_start,
             self.settings.general.viewport_end,
@@ -954,7 +917,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self.detailed_timeline.set_markers([])
         self.overview_timeline.set_markers([])
 
-        self.preprocess_button.setEnabled(True)
         self.play_toggle.setEnabled(True)
         self.mark_stop_button.setEnabled(True)
 
@@ -997,7 +959,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
     def stop_playback(self) -> None:
         if not self.video_player.is_loaded():
             return
-        self._cancel_auto_track_task()
         self.playback_timer.stop()
         self._update_play_button(False)
         self._decode_in_flight = False
@@ -1022,7 +983,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             return
 
         was_playing = self.playback_timer.isActive()
-        self._cancel_auto_track_task()
 
         frame = self.video_player.seek(frame_index)
         if frame is None:
@@ -1097,102 +1057,16 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         QtCore.qWarning(f"Frame decode error: {message}")
         self._decode_in_flight = False
 
-    # ------------------------------------------------------------------
-    # Preprocessing & tracking
-    # ------------------------------------------------------------------
-    def _preprocess_video(self) -> None:
-        if not self.video_player.is_loaded():
-            return
-
-        self.playback_timer.stop()
-        self._update_play_button(False)
-
-        metadata = self.video_player.metadata
-        if metadata.frame_count <= 0:
-            QtWidgets.QMessageBox.information(self, "Info", "Video has no frames to preprocess.")
-            return
-
-        progress = QtWidgets.QProgressDialog("Preprocessing video...", "Cancel", 0, metadata.frame_count, self)
-        progress.setWindowModality(QtCore.Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
-
-        self._invalidate_preprocessing()
-        self.custom_tracker.reset()
-        self._refresh_issue_panel()
-
-        custom_results: Dict[int, CustomPointFrameResult] = {}
-
-        frame = self.video_player.read_first_frame()
-        if frame is None:
-            progress.close()
-            QtWidgets.QMessageBox.warning(self, "Warning", "Unable to read the first frame.")
-            return
-
-        cancelled = False
-        for _ in range(metadata.frame_count):
-            QtWidgets.QApplication.processEvents()
-            if progress.wasCanceled():
-                cancelled = True
-                break
-
-            frame_index = self.video_player.current_frame_index
-            custom_result = self.custom_tracker.process_frame(frame, frame_index, record=True)
-
-            custom_results[frame_index] = custom_result
-            self._apply_frame_results(custom_result)
-
-            progress.setValue(frame_index + 1)
-            frame = self.video_player.read_next()
-            if frame is None:
-                break
-
-        progress.close()
-
-        if cancelled:
-            QtWidgets.QMessageBox.information(
-                self, "Preprocess Cancelled", "Preprocessing cancelled. Live tracking will be used."
-            )
-            self._invalidate_preprocessing()
-            first_frame = self.video_player.seek(0)
-            if first_frame is not None:
-                self._process_frame(first_frame, record=True)
-            return
-
-        self.preprocessed_custom_results = custom_results
-        self.use_preprocessed_results = True
-
-        first_frame = self.video_player.seek(0)
-        if first_frame is not None:
-            self._process_frame(first_frame, record=False)
-            self.video_container.reset_view()
-
-        QtWidgets.QMessageBox.information(self, "Preprocess Complete", "Tracking data cached for faster playback.")
-
     def _process_frame(self, frame_bgr, record: bool) -> None:
         frame_index = self.video_player.current_frame_index
         self.current_frame_bgr = frame_bgr.copy()
 
-        if self.use_preprocessed_results and frame_index in self.preprocessed_custom_results:
-            custom_result = self.preprocessed_custom_results.get(frame_index, CustomPointFrameResult({}, [], []))
-            self.custom_tracker.current_positions = dict(custom_result.positions)
-            self._apply_frame_results(custom_result, update_issues=False)
-        else:
-            custom_result = self.custom_tracker.process_frame(frame_bgr, frame_index, record=record)
-            self._apply_frame_results(custom_result)
+        self.custom_tracker.process_frame(frame_bgr, frame_index, record=record)
 
         self._render_current_frame()
         self._refresh_point_statuses()
         self._update_time_labels()
         self._update_timeline_position()
-
-    def _apply_frame_results(
-        self,
-        custom_result: Optional[CustomPointFrameResult],
-        update_issues: bool = True,
-    ) -> None:
-        if not update_issues or not custom_result:
-            return
 
     # ------------------------------------------------------------------
     # Rendering helpers
@@ -1759,156 +1633,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._update_timeline_absences()
         self._update_timeline_position(adjust_viewport=False)
 
-    def _auto_track_forward(self, point_name: str) -> None:
-        if not self.video_player.is_loaded() or not self.auto_tracking_enabled:
-            return
-        tracked_point = self.custom_tracker.point_definitions().get(point_name)
-        if not tracked_point:
-            return
-
-        current_frame = self.video_player.current_frame_index
-        start_pos = tracked_point.positions.get(current_frame)
-        if start_pos is None:
-            return
-
-        future_keyframes = [frame for frame in tracked_point.keyframe_frames() if frame > current_frame]
-        if future_keyframes:
-            return
-
-        metadata = self.video_player.metadata
-        if metadata.frame_count <= current_frame + 1:
-            return
-
-        frames_remaining = metadata.frame_count - 1 - current_frame
-        max_frames = min(self.max_auto_track_frames, max(0, frames_remaining))
-        if max_frames <= 0:
-            return
-
-        self._cancel_auto_track_task()
-
-        if self.current_frame_bgr is not None:
-            self.custom_tracker.prev_gray = cv2.cvtColor(self.current_frame_bgr, cv2.COLOR_BGR2GRAY)
-
-        self.auto_track_task = {
-            "point_name": point_name,
-            "original_frame": current_frame,
-            "frames_remaining": max_frames,
-            "frames_processed": 0,
-            "last_good_index": current_frame,
-            "last_good_pos": start_pos,
-            "samples": [(current_frame, start_pos)],
-        }
-        self.auto_track_timer.start(0)
-
-    def _auto_track_step(self) -> None:
-        task = self.auto_track_task
-        if not task or not self.video_player.is_loaded() or not self.auto_tracking_enabled:
-            self._complete_auto_track_task(finalize=False)
-            return
-
-        metadata = self.video_player.metadata
-        if task["frames_processed"] >= task["frames_remaining"] or self.video_player.current_frame_index >= metadata.frame_count - 1:
-            self._complete_auto_track_task()
-            return
-
-        frame = self.video_player.read_next()
-        if frame is None:
-            self._complete_auto_track_task()
-            return
-
-        frame_index = self.video_player.current_frame_index
-        result = self.custom_tracker.process_frame(frame, frame_index, record=True)
-        self._apply_frame_results(result)
-
-        point_name = task["point_name"]
-        point_issue = next((issue for issue in result.issues if issue.point_name == point_name), None)
-        pos = result.positions.get(point_name)
-        if point_issue or pos is None:
-            self._complete_auto_track_task()
-            return
-
-        task["last_good_index"] = frame_index
-        task["last_good_pos"] = pos
-        task["samples"].append((frame_index, pos))
-        task["frames_processed"] += 1
-
-        if task["frames_processed"] >= task["frames_remaining"]:
-            self._complete_auto_track_task()
-
-    def _cancel_auto_track_task(self, finalize: bool = False) -> None:
-        if not self.auto_track_task:
-            return
-        task = self.auto_track_task
-        self.auto_track_timer.stop()
-        self.auto_track_task = None
-        if finalize:
-            self._complete_auto_track_task(task, finalize=True)
-        else:
-            frame = self.video_player.seek(task["original_frame"])
-            if frame is not None:
-                self._process_frame(frame, record=False)
-            self._update_timeline_position(adjust_viewport=False)
-
-    def _complete_auto_track_task(self, task: Optional[dict] = None, finalize: bool = True) -> None:
-        if task is None:
-            task = self.auto_track_task
-        if not task:
-            self.auto_track_timer.stop()
-            self.auto_track_task = None
-            return
-
-        self.auto_track_timer.stop()
-        self.auto_track_task = None
-
-        point_name = task["point_name"]
-        original_frame = task["original_frame"]
-        added_keyframe = False
-
-        if finalize and task["last_good_pos"] is not None and task["last_good_index"] > original_frame:
-            self.custom_tracker.add_auto_keyframe(point_name, task["last_good_index"])
-            added_keyframe = True
-
-        if finalize and len(task["samples"]) > 2:
-            if self._mark_direction_changes(point_name, task["samples"]):
-                added_keyframe = True
-
-        frame = self.video_player.seek(original_frame)
-        if frame is not None:
-            self._process_frame(frame, record=False)
-
-        if finalize and added_keyframe:
-            self._refresh_issue_panel()
-        self._update_timeline_position(adjust_viewport=False)
-
-    def _mark_direction_changes(self, point_name: str, samples: List[Tuple[int, Point2D]]) -> bool:
-        tracked_point = self.custom_tracker.point_definitions().get(point_name)
-        if not tracked_point or len(samples) < 3:
-            return False
-
-        key_added = False
-        prev_vec = None
-        threshold_cos = math.cos(math.radians(self.direction_threshold))
-
-        for idx in range(1, len(samples)):
-            prev_frame, prev_pos = samples[idx - 1]
-            frame, pos = samples[idx]
-            vec_x = pos[0] - prev_pos[0]
-            vec_y = pos[1] - prev_pos[1]
-            mag = math.hypot(vec_x, vec_y)
-            if mag < 1e-5:
-                continue
-            norm_vec = (vec_x / mag, vec_y / mag)
-            if prev_vec is not None:
-                dot = prev_vec[0] * norm_vec[0] + prev_vec[1] * norm_vec[1]
-                dot = max(-1.0, min(1.0, dot))
-                if dot < threshold_cos:
-                    if frame not in tracked_point.keyframes:
-                        self.custom_tracker.add_auto_keyframe(point_name, frame)
-                        key_added = True
-            prev_vec = norm_vec
-
-        return key_added
-
     def _handle_video_click(self, x: float, y: float) -> None:
         if not self.video_player.is_loaded():
             return
@@ -1922,15 +1646,12 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         if point not in self.custom_tracker.point_definitions():
             return
 
-        self._cancel_auto_track_task()
-        self._invalidate_preprocessing()
         self.custom_tracker.set_manual_point(self.video_player.current_frame_index, point, (x, y))
         self._refresh_issue_panel()
         self._refresh_point_statuses()
         self._update_timeline_markers()
         self._update_timeline_absences()
         self._render_current_frame()
-        self._auto_track_forward(point)
         self._update_timeline_position()
 
     def _clear_selected_point_history(self) -> None:
@@ -1938,8 +1659,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             return
         if self.active_point not in self.custom_tracker.point_definitions():
             return
-        self._cancel_auto_track_task()
-        self._invalidate_preprocessing()
         self.custom_tracker.clear_point_history(self.active_point)
         self._refresh_issue_panel()
         self._refresh_point_statuses()
@@ -1972,7 +1691,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             return
 
         total_frames = self.video_player.metadata.frame_count if self.video_player.is_loaded() else frame_index + 1
-        self._invalidate_preprocessing()
         if not self.custom_tracker.mark_stop_frame(self.active_point, frame_index, total_frames):
             QtWidgets.QMessageBox.information(
                 self,
@@ -2051,7 +1769,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         if end <= start:
             end = min(100.0, start + 5.0)
         self.viewport_range = (start, end)
-        self.auto_tracking_enabled = general.auto_track
         self.detailed_timeline.set_viewport_range(start, end)
         self.overview_timeline.set_viewport_range(start, end)
         self.overview_timeline.set_zoom_limits(
@@ -2143,8 +1860,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         base_color.setAlpha(235)
         auto_color = QtGui.QColor(255, 170, 60)
         auto_color.setAlpha(150)
-        interpolated_color = QtGui.QColor(90, 210, 140)
-        interpolated_color.setAlpha(130)
         absence_color = QtGui.QColor(255, 80, 80)
         absence_color.setAlpha(170)
         provisional_color = QtGui.QColor(base_color)
@@ -2162,12 +1877,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             if anchor.frame in manual_frames:
                 continue
             register_marker(anchor.frame, provisional_color, "provisional", 70)
-
-        interpolated_frames = set(tracked_point.interpolation_cache.keys())
-        interpolated_frames.difference_update(manual_frames)
-        interpolated_frames.difference_update(auto_frames)
-        for frame in interpolated_frames:
-            register_marker(frame, interpolated_color, "interpolated", 40)
 
         for start, end in tracked_point.absent_ranges:
             register_marker(start, absence_color, "stop", 100)
@@ -2200,26 +1909,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
     def trail_length(self) -> int:
         return max(1, int(self.settings.general.trail_length))
 
-    @property
-    def max_auto_track_frames(self) -> int:
-        return max(1, int(self.settings.tracking.max_auto_track_frames))
-
-    @property
-    def direction_threshold(self) -> float:
-        return float(self.settings.tracking.direction_change_threshold)
-
-    def _set_auto_tracking_enabled(self, enabled: bool) -> None:
-        self.auto_tracking_enabled = enabled
-        self.settings.general.auto_track = enabled
-        if not enabled:
-            self._cancel_auto_track_task()
-        self.settings_manager.save()
-
-    def _invalidate_preprocessing(self) -> None:
-        self._cancel_auto_track_task()
-        self.use_preprocessed_results = False
-        self.preprocessed_custom_results.clear()
-
     def _update_play_button(self, playing: bool) -> None:
         self.play_toggle.setText("⏸" if playing else "▶")
 
@@ -2239,7 +1928,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self.playback_timer.stop()
-        self._cancel_auto_track_task()
         self._decoder_thread.quit()
         self._decoder_thread.wait(1500)
         self.video_player.release()

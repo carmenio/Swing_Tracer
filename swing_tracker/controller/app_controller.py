@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from ..model.app_model import SwingTrackerModel
 from ..model.settings import AppSettings, SettingsManager
-from ..model.tracking.custom_points import CustomPointFrameResult
 from ..model.video import VideoPlayer
 
 if False:  # pragma: no cover - for type checking without circular imports
@@ -38,14 +37,6 @@ class SwingTrackerController:
         self._model.settings = value
 
     @property
-    def auto_tracking_enabled(self) -> bool:
-        return self._model.auto_tracking_enabled
-
-    @auto_tracking_enabled.setter
-    def auto_tracking_enabled(self, value: bool) -> None:
-        self._model.auto_tracking_enabled = value
-
-    @property
     def video_player(self) -> VideoPlayer:
         return self._model.video_player
 
@@ -60,24 +51,6 @@ class SwingTrackerController:
     @current_frame_bgr.setter
     def current_frame_bgr(self, frame: Optional[Any]) -> None:
         self._model.current_frame_bgr = frame
-
-    @property
-    def preprocessed_custom_results(self) -> Dict[int, CustomPointFrameResult]:
-        return self._model.preprocessed_custom_results
-
-    @preprocessed_custom_results.setter
-    def preprocessed_custom_results(
-        self, results: Dict[int, CustomPointFrameResult]
-    ) -> None:
-        self._model.preprocessed_custom_results = results
-
-    @property
-    def use_preprocessed_results(self) -> bool:
-        return self._model.use_preprocessed_results
-
-    @use_preprocessed_results.setter
-    def use_preprocessed_results(self, value: bool) -> None:
-        self._model.use_preprocessed_results = value
 
     @property
     def active_point(self) -> Optional[str]:

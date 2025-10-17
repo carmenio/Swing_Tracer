@@ -136,7 +136,7 @@ class SettingsDialog(QtWidgets.QDialog):
         header_layout = QtWidgets.QVBoxLayout()
         title_label = QtWidgets.QLabel("Settings")
         title_label.setStyleSheet("font-size: 20px; font-weight: 600; color: #ffffff;")
-        subtitle_label = QtWidgets.QLabel("Configure tracking, playback, and UI preferences")
+        subtitle_label = QtWidgets.QLabel("Configure playback and UI preferences")
         subtitle_label.setStyleSheet("color: #b0b0b0;")
         header_layout.addWidget(title_label)
         header_layout.addWidget(subtitle_label)
@@ -147,7 +147,6 @@ class SettingsDialog(QtWidgets.QDialog):
         self.tabs.setDocumentMode(True)
 
         self._general_tab = self._wrap_with_scroll(self._build_general_tab())
-        self._tracking_tab = self._wrap_with_scroll(self._build_tracking_tab())
         self._timeline_tab = self._wrap_with_scroll(self._build_timeline_tab())
         self._playback_tab = self._wrap_with_scroll(self._build_playback_tab())
         self._input_tab = self._wrap_with_scroll(self._build_input_tab())
@@ -155,7 +154,6 @@ class SettingsDialog(QtWidgets.QDialog):
         self._data_tab = self._wrap_with_scroll(self._build_data_tab())
 
         self.tabs.addTab(self._general_tab, "General")
-        self.tabs.addTab(self._tracking_tab, "Tracking")
         self.tabs.addTab(self._timeline_tab, "Timeline")
         self.tabs.addTab(self._playback_tab, "Playback")
         self.tabs.addTab(self._input_tab, "Input")
@@ -190,10 +188,6 @@ class SettingsDialog(QtWidgets.QDialog):
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(widget)
         layout.setSpacing(20)
-
-        self.general_auto_track = QtWidgets.QCheckBox("Auto Track")
-        self.general_auto_track.setToolTip("Enable forward tracking after manual keyframes.")
-        layout.addWidget(self.general_auto_track)
 
         trail_layout = QtWidgets.QVBoxLayout()
         trail_label = QtWidgets.QLabel("Trail Length (frames)")
@@ -246,11 +240,6 @@ class SettingsDialog(QtWidgets.QDialog):
         self.control_reset_button.clicked.connect(self._handle_reset_session)
         controls_layout.addWidget(self.control_reset_button)
 
-        self.control_auto_track_button = QtWidgets.QPushButton()
-        self.control_auto_track_button.setCursor(QtCore.Qt.PointingHandCursor)
-        self.control_auto_track_button.clicked.connect(self._handle_toggle_auto_track)
-        controls_layout.addWidget(self.control_auto_track_button)
-
         self.control_clear_history_button = QtWidgets.QPushButton("Clear Selected Point History")
         self.control_clear_history_button.setCursor(QtCore.Qt.PointingHandCursor)
         self.control_clear_history_button.clicked.connect(self._handle_clear_point_history)
@@ -262,79 +251,6 @@ class SettingsDialog(QtWidgets.QDialog):
         self.general_trail_slider.valueChanged.connect(
             lambda value: self.general_trail_value.setText(str(value))
         )
-        return widget
-
-    def _build_tracking_tab(self) -> QtWidgets.QWidget:
-        widget = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(widget)
-        layout.setSpacing(18)
-
-        self.tracking_enable_smoothing = QtWidgets.QCheckBox("Enable Smoothing")
-        layout.addWidget(self.tracking_enable_smoothing)
-
-        self.tracking_truncate_future = QtWidgets.QCheckBox("Delete future points after manual keyframe")
-        self.tracking_truncate_future.setToolTip(
-            "If enabled, setting a manual keyframe clears tracked data on later frames."
-        )
-        layout.addWidget(self.tracking_truncate_future)
-
-        # Smoothing alpha
-        layout.addLayout(self._slider_row("Smoothing Alpha", "Weight for exponential smoothing (0-1)",
-                                          0, 100,
-                                          attr_name="tracking_smoothing_slider",
-                                          value_label_name="tracking_smoothing_value",
-                                          formatter=lambda v: f"{v / 100:.2f}"))
-
-        # Max auto track frames
-        layout.addLayout(self._spin_row("Max Auto Track Frames", "How many frames to evaluate after a keyframe",
-                                        "tracking_max_frames", 1, 600))
-
-        # Direction change threshold
-        layout.addLayout(self._slider_row("Direction Change Threshold (degrees)",
-                                          "Angle change that triggers auto keyframes/issues",
-                                          0, 180,
-                                          attr_name="tracking_direction_slider",
-                                          value_label_name="tracking_direction_value",
-                                          formatter=lambda v: f"{v}°"))
-
-        # Deviation threshold
-        layout.addLayout(self._spin_row("Deviation Threshold (pixels)",
-                                        "Drift allowed before logging an issue",
-                                        "tracking_deviation", 1, 200))
-
-        # Cache/history
-        layout.addLayout(self._spin_row("Cache Size", "", "tracking_cache_size", 0, 1000))
-        layout.addLayout(self._spin_row("History Frames", "", "tracking_history_frames", 0, 2000))
-
-        # Optical flow parameters grid
-        flow_group = QtWidgets.QGroupBox("Optical Flow Parameters")
-        flow_layout = QtWidgets.QGridLayout(flow_group)
-        flow_layout.addWidget(QtWidgets.QLabel("Window Size"), 0, 0)
-        self.tracking_flow_window = QtWidgets.QSpinBox()
-        self.tracking_flow_window.setRange(5, 61)
-        flow_layout.addWidget(self.tracking_flow_window, 0, 1)
-        flow_layout.addWidget(QtWidgets.QLabel("Pyramid Level"), 0, 2)
-        self.tracking_flow_pyramid = QtWidgets.QSpinBox()
-        self.tracking_flow_pyramid.setRange(1, 6)
-        flow_layout.addWidget(self.tracking_flow_pyramid, 0, 3)
-        flow_layout.addWidget(QtWidgets.QLabel("Termination"), 0, 4)
-        self.tracking_flow_termination = QtWidgets.QDoubleSpinBox()
-        self.tracking_flow_termination.setDecimals(3)
-        self.tracking_flow_termination.setRange(0.001, 1.0)
-        flow_layout.addWidget(self.tracking_flow_termination, 0, 5)
-        layout.addWidget(flow_group)
-
-        # Confidence thresholds
-        layout.addLayout(self._slider_row("Issue Threshold", "", 0, 100,
-                                          attr_name="tracking_issue_slider",
-                                          value_label_name="tracking_issue_value",
-                                          formatter=lambda v: f"{v / 100:.2f}"))
-        layout.addLayout(self._slider_row("Resolved Threshold", "", 0, 100,
-                                          attr_name="tracking_resolved_slider",
-                                          value_label_name="tracking_resolved_value",
-                                          formatter=lambda v: f"{v / 100:.2f}"))
-
-        layout.addStretch(1)
         return widget
 
     def _build_timeline_tab(self) -> QtWidgets.QWidget:
@@ -483,27 +399,17 @@ class SettingsDialog(QtWidgets.QDialog):
     def _refresh_control_buttons(self) -> None:
         main_window = self._main_window()
         video_loaded = False
-        auto_tracking_enabled = self.settings.general.auto_track
         active_point_available = False
 
         if main_window is not None:
             video_player = getattr(main_window, "video_player", None)
             video_loaded = bool(video_player and getattr(video_player, "is_loaded", lambda: False)())
-            auto_tracking_enabled = bool(getattr(main_window, "auto_tracking_enabled", auto_tracking_enabled))
             active_point = getattr(main_window, "active_point", None)
             tracker = getattr(main_window, "custom_tracker", None)
             if tracker and active_point and active_point in getattr(tracker, "point_definitions", lambda: {})():
                 active_point_available = True
 
         self.control_reset_button.setEnabled(video_loaded)
-
-        if auto_tracking_enabled:
-            self.control_auto_track_button.setText("Disable Auto Track")
-        else:
-            self.control_auto_track_button.setText("Enable Auto Track")
-
-        self.general_auto_track.setChecked(auto_tracking_enabled)
-        self.settings.general.auto_track = auto_tracking_enabled
 
         self.control_clear_history_button.setEnabled(active_point_available)
         if not active_point_available:
@@ -516,21 +422,6 @@ class SettingsDialog(QtWidgets.QDialog):
         main_window = self._main_window()
         if main_window and hasattr(main_window, "stop_playback"):
             main_window.stop_playback()
-        self._refresh_control_buttons()
-
-    def _handle_toggle_auto_track(self) -> None:
-        main_window = self._main_window()
-        current_state = self.general_auto_track.isChecked()
-        if main_window and hasattr(main_window, "_set_auto_tracking_enabled"):
-            new_state = not current_state
-            main_window._set_auto_tracking_enabled(new_state)
-            self.general_auto_track.setChecked(new_state)
-            self.settings.general.auto_track = new_state
-        else:
-            # Fallback to toggling settings only
-            new_state = not current_state
-            self.general_auto_track.setChecked(new_state)
-            self.settings.general.auto_track = new_state
         self._refresh_control_buttons()
 
     def _handle_clear_point_history(self) -> None:
@@ -648,32 +539,12 @@ class SettingsDialog(QtWidgets.QDialog):
     # ------------------------------------------------------------------
     def _populate_fields(self) -> None:
         g = self.settings.general
-        self.general_auto_track.setChecked(g.auto_track)
         self.general_trail_slider.setValue(g.trail_length)
         self.general_trail_value.setText(str(g.trail_length))
         self.general_viewport_start.setValue(g.viewport_start)
         self.general_viewport_end.setValue(g.viewport_end)
         index = self.general_theme.findText(g.theme)
         self.general_theme.setCurrentIndex(max(0, index))
-
-        t = self.settings.tracking
-        self.tracking_enable_smoothing.setChecked(t.smoothing_enabled)
-        self.tracking_truncate_future.setChecked(t.truncate_future_on_manual_set)
-        self.tracking_smoothing_slider.setValue(int(t.smoothing_alpha * 100))
-        self.tracking_smoothing_value.setText(f"{t.smoothing_alpha:.2f}")
-        self.tracking_max_frames.setValue(t.max_auto_track_frames)
-        self.tracking_direction_slider.setValue(int(t.direction_change_threshold))
-        self.tracking_direction_value.setText(f"{int(t.direction_change_threshold)}°")
-        self.tracking_deviation.setValue(int(t.deviation_threshold))
-        self.tracking_cache_size.setValue(t.cache_size)
-        self.tracking_history_frames.setValue(t.history_frames)
-        self.tracking_flow_window.setValue(t.optical_flow_window_size)
-        self.tracking_flow_pyramid.setValue(t.optical_flow_pyramid)
-        self.tracking_flow_termination.setValue(t.optical_flow_termination)
-        self.tracking_issue_slider.setValue(int(t.issue_confidence_threshold * 100))
-        self.tracking_issue_value.setText(f"{t.issue_confidence_threshold:.2f}")
-        self.tracking_resolved_slider.setValue(int(t.resolved_confidence_threshold * 100))
-        self.tracking_resolved_value.setText(f"{t.resolved_confidence_threshold:.2f}")
 
         tl = self.settings.timeline
         for key, btn in self.timeline_color_buttons.items():
@@ -739,7 +610,6 @@ class SettingsDialog(QtWidgets.QDialog):
 
     def _collect_values(self) -> None:
         g = self.settings.general
-        g.auto_track = self.general_auto_track.isChecked()
         g.trail_length = self.general_trail_slider.value()
         start = self.general_viewport_start.value()
         end = self.general_viewport_end.value()
@@ -748,21 +618,6 @@ class SettingsDialog(QtWidgets.QDialog):
         g.viewport_start = start
         g.viewport_end = end
         g.theme = self.general_theme.currentText()
-
-        t = self.settings.tracking
-        t.smoothing_alpha = self.tracking_smoothing_slider.value() / 100.0
-        t.max_auto_track_frames = self.tracking_max_frames.value()
-        t.direction_change_threshold = self.tracking_direction_slider.value()
-        t.deviation_threshold = self.tracking_deviation.value()
-        t.cache_size = self.tracking_cache_size.value()
-        t.history_frames = self.tracking_history_frames.value()
-        t.optical_flow_window_size = self.tracking_flow_window.value()
-        t.optical_flow_pyramid = self.tracking_flow_pyramid.value()
-        t.optical_flow_termination = self.tracking_flow_termination.value()
-        t.issue_confidence_threshold = self.tracking_issue_slider.value() / 100.0
-        t.resolved_confidence_threshold = self.tracking_resolved_slider.value() / 100.0
-        t.smoothing_enabled = self.tracking_enable_smoothing.isChecked()
-        t.truncate_future_on_manual_set = self.tracking_truncate_future.isChecked()
 
         tl = self.settings.timeline
         for key, btn in self.timeline_color_buttons.items():

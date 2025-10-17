@@ -220,6 +220,8 @@ class DetailedTimeline(QtWidgets.QWidget):
 
             # Draw individual markers
             for marker, marker_pos in visible_markers:
+                if marker.category == "interpolated":
+                    continue
                 percent = (marker_pos - start_index) / span
                 x = content.left() + percent * content.width()
                 point_color = QtGui.QColor(marker.color)
