@@ -6,7 +6,7 @@ from PyQt5 import QtWidgets
 from .controller import SwingTrackerController
 from .view import SwingTrackerWindow
 
-
+# Runs the GUI
 def main() -> None:
     app = QtWidgets.QApplication(sys.argv)
     root_path = Path(__file__).resolve().parent.parent

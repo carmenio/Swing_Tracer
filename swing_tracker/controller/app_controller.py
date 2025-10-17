@@ -44,6 +44,9 @@ class SwingTrackerController:
     def custom_tracker(self):  # type: ignore[override]
         return self._model.custom_tracker
 
+    def set_tracking_video_path(self, path: Optional[Path]) -> None:
+        self._model.set_tracking_video_path(path)
+
     @property
     def current_frame_bgr(self) -> Optional[Any]:
         return self._model.current_frame_bgr

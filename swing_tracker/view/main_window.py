@@ -1,6 +1,8 @@
 from bisect import bisect_left
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
+from pathlib import Path
+
 import cv2
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -895,10 +897,13 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._update_play_button(False)
 
         try:
+            self.controller.set_tracking_video_path(None)
             metadata = self.video_player.load(file_path)
         except ValueError:
             QtWidgets.QMessageBox.critical(self, "Error", "Failed to open video.")
             return
+
+        self.controller.set_tracking_video_path(Path(file_path))
 
         self.viewport_range = (
             self.settings.general.viewport_start,
@@ -916,6 +921,8 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self.overview_timeline.set_current_frame(0)
         self.detailed_timeline.set_markers([])
         self.overview_timeline.set_markers([])
+        self.detailed_timeline.set_segments([])
+        self.overview_timeline.set_segments([])
 
         self.play_toggle.setEnabled(True)
         self.mark_stop_button.setEnabled(True)
@@ -1827,12 +1834,16 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         if not self.video_player.is_loaded() or not self.active_point:
             self.detailed_timeline.set_markers(markers)
             self.overview_timeline.set_markers(markers)
+            self.detailed_timeline.set_segments([])
+            self.overview_timeline.set_segments([])
             return
 
         tracked_point = self.custom_tracker.point_definitions().get(self.active_point)
         if not tracked_point:
             self.detailed_timeline.set_markers(markers)
             self.overview_timeline.set_markers(markers)
+            self.detailed_timeline.set_segments([])
+            self.overview_timeline.set_segments([])
             return
 
         frame_count = self.video_player.metadata.frame_count
@@ -1887,8 +1898,11 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             register_marker(tracked_point.open_absence_start, absence_color, "stop", 100)
 
         markers = [entry[1] for entry in sorted(marker_records.values(), key=lambda item: item[1].frame)]
+        segments = self.custom_tracker.tracking_segments(self.active_point)
         self.detailed_timeline.set_markers(markers)
         self.overview_timeline.set_markers(markers)
+        self.detailed_timeline.set_segments(segments)
+        self.overview_timeline.set_segments(segments)
 
     def _update_timeline_absences(self) -> None:
         ranges: List[Tuple[int, int]] = []
@@ -1930,5 +1944,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self.playback_timer.stop()
         self._decoder_thread.quit()
         self._decoder_thread.wait(1500)
+        self.controller.set_tracking_video_path(None)
         self.video_player.release()
         super().closeEvent(event)

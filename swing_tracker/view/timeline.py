@@ -1,10 +1,11 @@
 import math
-import math
 from dataclasses import dataclass
 from bisect import bisect_left, bisect_right
-from typing import Any, Iterable, List, Optional, Tuple, cast
+from typing import Any, Dict, Iterable, List, Optional, Tuple, cast
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+
+from ..model.tracking.segments import TrackingSegment
 
 
 def clamp(value: float, min_value: float, max_value: float) -> float:
@@ -54,6 +55,8 @@ class DetailedTimeline(QtWidgets.QWidget):
         self.frame_map: List[int] = []
         self._marker_frames: List[int] = []
         self._hit_regions: List[Tuple[int, QtCore.QPointF, float]] = []
+        self.segments: List[TrackingSegment] = []
+        self._segment_lookup: Dict[Tuple[int, int], TrackingSegment] = {}
 
         self._dragging: bool = False
         self._highlight_frame: Optional[int] = None
@@ -129,6 +132,16 @@ class DetailedTimeline(QtWidgets.QWidget):
         if self.frame_map != unique:
             self.frame_map = unique
             self.set_total_frames(len(unique))
+            self.update()
+
+    def set_segments(self, segments: Iterable[TrackingSegment]) -> None:
+        parsed: List[TrackingSegment] = [segment for segment in segments]
+        parsed.sort(key=lambda segment: (segment.start_key.frame, segment.end_key.frame))
+        if self.segments != parsed:
+            self.segments = parsed
+            self._segment_lookup = {
+                (segment.start_key.frame, segment.end_key.frame): segment for segment in parsed
+            }
             self.update()
 
     def pulse_highlight(self, frame_index: int) -> None:
@@ -211,12 +224,15 @@ class DetailedTimeline(QtWidgets.QWidget):
                 end_x = content.left() + end_percent * content.width()
                 if end_x <= start_x:
                     continue
-                line_color = marker_line_color(marker)
-                painter.setPen(QtGui.QPen(line_color, 3, cap=QtCore.Qt.RoundCap))
-                painter.drawLine(
-                    QtCore.QPointF(start_x, center_y),
-                    QtCore.QPointF(end_x, center_y),
-                )
+                segment = self._segment_lookup.get((marker.frame, next_marker.frame))
+                start_point = QtCore.QPointF(start_x, center_y)
+                end_point = QtCore.QPointF(end_x, center_y)
+                if segment:
+                    self._draw_segment_line(painter, segment, start_point, end_point)
+                else:
+                    line_color = marker_line_color(marker)
+                    painter.setPen(QtGui.QPen(line_color, 3, cap=QtCore.Qt.RoundCap))
+                    painter.drawLine(start_point, end_point)
 
             # Draw individual markers
             for marker, marker_pos in visible_markers:
@@ -263,6 +279,41 @@ class DetailedTimeline(QtWidgets.QWidget):
             x = content.left() + percent * content.width()
             painter.setPen(QtGui.QPen(QtGui.QColor("#ffffff"), 2))
             painter.drawLine(QtCore.QPointF(x, content.top()), QtCore.QPointF(x, content.bottom()))
+
+    def _draw_segment_line(
+        self,
+        painter: QtGui.QPainter,
+        segment: TrackingSegment,
+        start_point: QtCore.QPointF,
+        end_point: QtCore.QPointF,
+    ) -> None:
+        if segment.accepted and segment.entity_colour:
+            color = QtGui.QColor(segment.entity_colour)
+            pen = QtGui.QPen(color, 3, cap=QtCore.Qt.RoundCap)
+            painter.setPen(pen)
+            painter.drawLine(start_point, end_point)
+            return
+
+        color_stops = segment.color_stops()
+        if not color_stops:
+            pen = QtGui.QPen(QtGui.QColor("#00ff00"), 3, cap=QtCore.Qt.RoundCap)
+            painter.setPen(pen)
+            painter.drawLine(start_point, end_point)
+            return
+
+        gradient = QtGui.QLinearGradient(start_point, end_point)
+        span = max(1, segment.end_key.frame - segment.start_key.frame)
+        for frame, colour in color_stops:
+            ratio = (frame - segment.start_key.frame) / span
+            ratio = max(0.0, min(1.0, ratio))
+            gradient.setColorAt(ratio, QtGui.QColor(colour))
+
+        pen = QtGui.QPen()
+        pen.setWidth(3)
+        pen.setCapStyle(QtCore.Qt.RoundCap)
+        pen.setBrush(QtGui.QBrush(gradient))
+        painter.setPen(pen)
+        painter.drawLine(start_point, end_point)
 
     def _on_highlight_value_changed(self, value: object) -> None:
         try:
@@ -429,6 +480,8 @@ class OverviewTimeline(QtWidgets.QWidget):
         self.markers: List[TimelineMarker] = []
         self.absence_ranges: List[Tuple[int, int]] = []
         self.frame_map: List[int] = []
+        self.segments: List[TrackingSegment] = []
+        self._segment_lookup: Dict[Tuple[int, int], TrackingSegment] = {}
 
         self._drag_mode: Optional[str] = None
         self._drag_start_x: float = 0.0
@@ -505,6 +558,16 @@ class OverviewTimeline(QtWidgets.QWidget):
             self.set_total_frames(len(unique))
             self.update()
 
+    def set_segments(self, segments: Iterable[TrackingSegment]) -> None:
+        parsed: List[TrackingSegment] = [segment for segment in segments]
+        parsed.sort(key=lambda segment: (segment.start_key.frame, segment.end_key.frame))
+        if self.segments != parsed:
+            self.segments = parsed
+            self._segment_lookup = {
+                (segment.start_key.frame, segment.end_key.frame): segment for segment in parsed
+            }
+            self.update()
+
     # ------------------------------------------------------------------
     # Event overrides (zoom support)
     # ------------------------------------------------------------------
@@ -578,6 +641,18 @@ class OverviewTimeline(QtWidgets.QWidget):
                 painter.drawRect(QtCore.QRectF(left, content.top(), max(1.0, right - left), content.height()))
             painter.restore()
 
+        center_y = content.center().y()
+        for segment in self.segments:
+            start_pos = self._position_for_frame(segment.start_key.frame)
+            end_pos = self._position_for_frame(segment.end_key.frame)
+            if start_pos is None or end_pos is None or end_pos <= start_pos:
+                continue
+            start_ratio = (start_pos / total_span) if total_span else 0.0
+            end_ratio = (end_pos / total_span) if total_span else 0.0
+            start_point = QtCore.QPointF(content.left() + start_ratio * content.width(), center_y)
+            end_point = QtCore.QPointF(content.left() + end_ratio * content.width(), center_y)
+            self._draw_segment_band(painter, segment, start_point, end_point)
+
         # Draw all markers with reduced opacity
         for marker in self.markers:
             marker_pos = self._position_for_frame(marker.frame)
@@ -615,6 +690,41 @@ class OverviewTimeline(QtWidgets.QWidget):
         right_handle = QtCore.QRectF(view_right - handle_width / 2, content.top(), handle_width, content.height())
         painter.drawRoundedRect(left_handle, 3, 3)
         painter.drawRoundedRect(right_handle, 3, 3)
+
+    def _draw_segment_band(
+        self,
+        painter: QtGui.QPainter,
+        segment: TrackingSegment,
+        start_point: QtCore.QPointF,
+        end_point: QtCore.QPointF,
+    ) -> None:
+        if segment.accepted and segment.entity_colour:
+            color = QtGui.QColor(segment.entity_colour)
+            pen = QtGui.QPen(color, 2, cap=QtCore.Qt.RoundCap)
+            painter.setPen(pen)
+            painter.drawLine(start_point, end_point)
+            return
+
+        color_stops = segment.color_stops()
+        if not color_stops:
+            pen = QtGui.QPen(QtGui.QColor("#00ff00"), 2, cap=QtCore.Qt.RoundCap)
+            painter.setPen(pen)
+            painter.drawLine(start_point, end_point)
+            return
+
+        gradient = QtGui.QLinearGradient(start_point, end_point)
+        span = max(1, segment.end_key.frame - segment.start_key.frame)
+        for frame, colour in color_stops:
+            ratio = (frame - segment.start_key.frame) / span
+            ratio = max(0.0, min(1.0, ratio))
+            gradient.setColorAt(ratio, QtGui.QColor(colour))
+
+        pen = QtGui.QPen()
+        pen.setWidth(2)
+        pen.setCapStyle(QtCore.Qt.RoundCap)
+        pen.setBrush(QtGui.QBrush(gradient))
+        painter.setPen(pen)
+        painter.drawLine(start_point, end_point)
 
     # ------------------------------------------------------------------
     # Interaction
