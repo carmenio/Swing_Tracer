@@ -1,3 +1,4 @@
+from bisect import bisect_left
 from typing import Any, Dict, Iterable, List, Optional, Tuple, cast
 
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -20,6 +21,10 @@ class DetailedTimeline(QtWidgets.QWidget):
         self.viewport_range: Tuple[float, float] = (0.0, 100.0)
         self.markers: Dict[int, QtGui.QColor] = {}
         self.absence_ranges: List[Tuple[int, int]] = []
+        self.frame_map: List[int] = []
+        self.frame_map: List[int] = []
+        self.frame_map: List[int] = []
+        self.frame_map: List[int] = []
 
         self._dragging: bool = False
 
@@ -30,8 +35,6 @@ class DetailedTimeline(QtWidgets.QWidget):
         total = max(0, total)
         if self.total_frames != total:
             self.total_frames = total
-            if self.current_frame >= total and total > 0:
-                self.current_frame = total - 1
             self.update()
 
     def set_current_frame(self, frame_index: int) -> None:
@@ -74,6 +77,13 @@ class DetailedTimeline(QtWidgets.QWidget):
             self.absence_ranges = normalized
             self.update()
 
+    def set_frame_map(self, frames: Iterable[int]) -> None:
+        unique = sorted({max(0, int(frame)) for frame in frames})
+        if self.frame_map != unique:
+            self.frame_map = unique
+            self.set_total_frames(len(unique))
+            self.update()
+
     # ------------------------------------------------------------------
     # Painting
     # ------------------------------------------------------------------
@@ -89,40 +99,46 @@ class DetailedTimeline(QtWidgets.QWidget):
         painter.setPen(QtGui.QColor("#000000"))
         painter.drawRoundedRect(content, 8, 8)
 
-        if self.total_frames <= 1:
+        if len(self.frame_map) <= 1:
             return
 
-        start_frame, end_frame = self._viewport_frames()
-        span = max(1.0, end_frame - start_frame)
+        start_index, end_index = self._viewport_indices()
+        span = max(1.0, end_index - start_index)
 
         if self.absence_ranges:
             painter.save()
             painter.setPen(QtCore.Qt.NoPen)
             painter.setBrush(QtGui.QColor(255, 140, 105, 90))
             for start, end in self.absence_ranges:
-                if end < start_frame or start > end_frame:
+                start_pos = self._position_for_frame(start)
+                end_pos = self._position_for_frame(end + 1)
+                if start_pos is None or end_pos is None:
                     continue
-                clamped_start = max(start_frame, float(start))
-                clamped_end = min(end_frame, float(end) + 1.0)
-                if clamped_end <= clamped_start:
+                if end_pos <= start_pos:
                     continue
-                left = content.left() + ((clamped_start - start_frame) / span) * content.width()
-                right = content.left() + ((clamped_end - start_frame) / span) * content.width()
+                if end_pos < start_index or start_pos > end_index:
+                    continue
+                clamped_start = max(start_index, start_pos)
+                clamped_end = min(end_index, end_pos)
+                left = content.left() + ((clamped_start - start_index) / span) * content.width()
+                right = content.left() + ((clamped_end - start_index) / span) * content.width()
                 painter.drawRect(QtCore.QRectF(left, content.top(), max(1.0, right - left), content.height()))
             painter.restore()
 
         # Draw markers within viewport
         for marker_frame, color in self.markers.items():
-            if marker_frame < start_frame or marker_frame > end_frame:
+            marker_pos = self._position_for_frame(marker_frame)
+            if marker_pos is None or marker_pos < start_index or marker_pos > end_index:
                 continue
-            percent = (marker_frame - start_frame) / span
+            percent = (marker_pos - start_index) / span
             x = content.left() + percent * content.width()
             painter.setPen(QtGui.QPen(color, 2))
             painter.drawLine(QtCore.QPointF(x, content.top()), QtCore.QPointF(x, content.bottom()))
 
         # Draw playhead if inside viewport
-        if start_frame <= self.current_frame <= end_frame:
-            percent = (self.current_frame - start_frame) / span
+        current_pos = self._position_for_frame(self.current_frame)
+        if current_pos is not None and start_index <= current_pos <= end_index:
+            percent = (current_pos - start_index) / span
             x = content.left() + percent * content.width()
             painter.setPen(QtGui.QPen(QtGui.QColor("#ffffff"), 2))
             painter.drawLine(QtCore.QPointF(x, content.top()), QtCore.QPointF(x, content.bottom()))
@@ -161,31 +177,58 @@ class DetailedTimeline(QtWidgets.QWidget):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _viewport_frames(self) -> Tuple[float, float]:
-        if self.total_frames <= 1:
+    def _viewport_indices(self) -> Tuple[float, float]:
+        if len(self.frame_map) <= 1:
             return (0.0, 1.0)
-        total_span = float(self.total_frames - 1)
+        total_span = float(len(self.frame_map) - 1)
         start_percent, end_percent = self.viewport_range
-        start_frame = (start_percent / 100.0) * total_span
-        end_frame = (end_percent / 100.0) * total_span
-        if end_frame <= start_frame:
-            end_frame = start_frame + 1.0
-        return start_frame, end_frame
+        start_index = (start_percent / 100.0) * total_span
+        end_index = (end_percent / 100.0) * total_span
+        if end_index <= start_index:
+            end_index = start_index + 1.0
+        return start_index, end_index
+
+    def _position_for_frame(self, frame: float) -> Optional[float]:
+        if not self.frame_map:
+            return None
+        target = float(frame)
+        idx = bisect_left(self.frame_map, int(target))
+        if idx < len(self.frame_map) and self.frame_map[idx] == int(target):
+            return float(idx)
+        if idx == 0 or idx >= len(self.frame_map):
+            return None
+        prev_frame = self.frame_map[idx - 1]
+        next_frame = self.frame_map[idx]
+        if next_frame == prev_frame:
+            return float(idx)
+        ratio = (target - prev_frame) / (next_frame - prev_frame)
+        return (idx - 1) + max(0.0, min(1.0, ratio))
+
+    def _frame_for_position(self, position: float) -> Optional[int]:
+        if not self.frame_map:
+            return None
+        if len(self.frame_map) == 1:
+            return self.frame_map[0]
+        idx = int(round(position))
+        idx = max(0, min(idx, len(self.frame_map) - 1))
+        return self.frame_map[idx]
 
     def _seek_at(self, pos: QtCore.QPoint) -> None:
-        if self.total_frames <= 1:
+        if len(self.frame_map) <= 0:
             return
         rect = self.rect().adjusted(12, 10, -12, -10)
         if rect.width() <= 0:
             return
-        start_frame, end_frame = self._viewport_frames()
-        span = max(1.0, end_frame - start_frame)
+        start_index, end_index = self._viewport_indices()
+        span = max(1.0, end_index - start_index)
 
         clamped_x = clamp(pos.x(), rect.left(), rect.right())
         percent = (clamped_x - rect.left()) / rect.width()
-        target_frame = start_frame + percent * span
-        target_frame = clamp(target_frame, 0.0, float(self.total_frames - 1))
-        self.seekRequested.emit(int(round(target_frame)))
+        target_position = start_index + percent * span
+        target_position = clamp(target_position, 0.0, float(max(0, len(self.frame_map) - 1)))
+        actual_frame = self._frame_for_position(target_position)
+        if actual_frame is not None:
+            self.seekRequested.emit(actual_frame)
 
 
 class OverviewTimeline(QtWidgets.QWidget):
@@ -206,6 +249,7 @@ class OverviewTimeline(QtWidgets.QWidget):
         self.viewport_range: Tuple[float, float] = (0.0, 100.0)
         self.markers: Dict[int, QtGui.QColor] = {}
         self.absence_ranges: List[Tuple[int, int]] = []
+        self.frame_map: List[int] = []
 
         self._drag_mode: Optional[str] = None
         self._drag_start_x: float = 0.0
@@ -220,8 +264,6 @@ class OverviewTimeline(QtWidgets.QWidget):
         total = max(0, total)
         if self.total_frames != total:
             self.total_frames = total
-            if self.current_frame >= total and total > 0:
-                self.current_frame = total - 1
             self.update()
 
     def set_current_frame(self, frame_index: int) -> None:
@@ -267,6 +309,13 @@ class OverviewTimeline(QtWidgets.QWidget):
             self.absence_ranges = normalized
             self.update()
 
+    def set_frame_map(self, frames: Iterable[int]) -> None:
+        unique = sorted({max(0, int(frame)) for frame in frames})
+        if self.frame_map != unique:
+            self.frame_map = unique
+            self.set_total_frames(len(unique))
+            self.update()
+
     # ------------------------------------------------------------------
     # Event overrides (zoom support)
     # ------------------------------------------------------------------
@@ -275,7 +324,7 @@ class OverviewTimeline(QtWidgets.QWidget):
             native = cast(QtGui.QNativeGestureEvent, event)
             if native.gestureType() == QtCore.Qt.ZoomNativeGesture:
                 value = native.value()
-                factor = 0.9 if value > 0 else 1.1
+                factor = 0.96 if value > 0 else 1.04
                 anchor = self._percent_from_position(native.localPos())
                 self._zoom_viewport(factor, anchor)
                 return True
@@ -285,7 +334,7 @@ class OverviewTimeline(QtWidgets.QWidget):
             if pinch and isinstance(pinch, QtWidgets.QPinchGesture):
                 if pinch.changeFlags() & QtWidgets.QPinchGesture.ScaleFactorChanged:
                     scale = pinch.scaleFactor()
-                    factor = 0.9 if scale > 1.0 else 1.1
+                    factor = 0.96 if scale > 1.0 else 1.04
                     center = pinch.centerPoint()
                     anchor = self._percent_from_position(center)
                     self._zoom_viewport(factor, anchor)
@@ -297,7 +346,7 @@ class OverviewTimeline(QtWidgets.QWidget):
         if event.modifiers() & QtCore.Qt.ControlModifier:
             delta = event.angleDelta().y()
             if delta != 0:
-                factor = 0.9 if delta > 0 else 1.1
+                factor = 0.96 if delta > 0 else 1.04
                 anchor = self._percent_from_position(event.pos())
                 self._zoom_viewport(factor, anchor)
             event.accept()
@@ -319,24 +368,22 @@ class OverviewTimeline(QtWidgets.QWidget):
         painter.setPen(QtGui.QColor("#000000"))
         painter.drawRoundedRect(content, 8, 8)
 
-        if self.total_frames <= 1 or content.width() <= 0:
+        if len(self.frame_map) <= 1 or content.width() <= 0:
             return
 
-        total_span = float(self.total_frames - 1)
+        total_span = float(len(self.frame_map) - 1)
 
         if self.absence_ranges:
             painter.save()
             painter.setPen(QtCore.Qt.NoPen)
             painter.setBrush(QtGui.QColor(255, 140, 105, 70))
             for start, end in self.absence_ranges:
-                if end < 0 or start > self.total_frames - 1:
+                start_pos = self._position_for_frame(start)
+                end_pos = self._position_for_frame(end + 1)
+                if start_pos is None or end_pos is None or end_pos <= start_pos:
                     continue
-                clamped_start = max(0.0, float(start))
-                clamped_end = min(float(self.total_frames - 1), float(end))
-                if clamped_end < clamped_start:
-                    continue
-                left_ratio = (clamped_start / total_span) if total_span else 0.0
-                right_ratio = ((clamped_end + 1.0) / total_span) if total_span else 1.0
+                left_ratio = (start_pos / total_span) if total_span else 0.0
+                right_ratio = (end_pos / total_span) if total_span else 1.0
                 left = content.left() + left_ratio * content.width()
                 right = content.left() + right_ratio * content.width()
                 painter.drawRect(QtCore.QRectF(left, content.top(), max(1.0, right - left), content.height()))
@@ -344,14 +391,18 @@ class OverviewTimeline(QtWidgets.QWidget):
 
         # Draw all markers with reduced opacity
         for marker, color in self.markers.items():
-            percent = (marker / total_span) if total_span else 0.0
+            marker_pos = self._position_for_frame(marker)
+            if marker_pos is None:
+                continue
+            percent = (marker_pos / total_span) if total_span else 0.0
             x = content.left() + percent * content.width()
             painter.setPen(QtGui.QPen(color, 2))
             painter.drawLine(QtCore.QPointF(x, content.top()), QtCore.QPointF(x, content.bottom()))
 
         # Draw current playhead
-        if self.current_frame <= total_span:
-            play_percent = self.current_frame / total_span if total_span else 0.0
+        current_pos = self._position_for_frame(self.current_frame)
+        if current_pos is not None:
+            play_percent = current_pos / total_span if total_span else 0.0
             play_x = content.left() + play_percent * content.width()
             painter.setPen(QtGui.QPen(QtGui.QColor("#ffffff"), 2))
             painter.drawLine(QtCore.QPointF(play_x, content.top()), QtCore.QPointF(play_x, content.bottom()))
@@ -379,7 +430,7 @@ class OverviewTimeline(QtWidgets.QWidget):
     # Interaction
     # ------------------------------------------------------------------
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
-        if event.button() != QtCore.Qt.LeftButton or self.total_frames <= 1:
+        if event.button() != QtCore.Qt.LeftButton or len(self.frame_map) <= 1:
             super().mousePressEvent(event)
             return
 
@@ -400,8 +451,10 @@ class OverviewTimeline(QtWidgets.QWidget):
         else:
             # seek to absolute timeline position
             percent = (x - content.left()) / content.width()
-            target_frame = int(round(percent * (self.total_frames - 1)))
-            self.seekRequested.emit(target_frame)
+            target_position = percent * float(max(0, len(self.frame_map) - 1))
+            actual_frame = self._frame_for_position(target_position)
+            if actual_frame is not None:
+                self.seekRequested.emit(actual_frame)
             self._drag_mode = None
             return
 
@@ -471,6 +524,31 @@ class OverviewTimeline(QtWidgets.QWidget):
             return 50.0
         x = clamp(pos.x(), content.left(), content.right())
         return ((x - content.left()) / content.width()) * 100.0
+
+    def _position_for_frame(self, frame: float) -> Optional[float]:
+        if not self.frame_map:
+            return None
+        target = float(frame)
+        idx = bisect_left(self.frame_map, int(target))
+        if idx < len(self.frame_map) and self.frame_map[idx] == int(target):
+            return float(idx)
+        if idx == 0 or idx >= len(self.frame_map):
+            return None
+        prev_frame = self.frame_map[idx - 1]
+        next_frame = self.frame_map[idx]
+        if next_frame == prev_frame:
+            return float(idx)
+        ratio = (target - prev_frame) / (next_frame - prev_frame)
+        return (idx - 1) + max(0.0, min(1.0, ratio))
+
+    def _frame_for_position(self, position: float) -> Optional[int]:
+        if not self.frame_map:
+            return None
+        if len(self.frame_map) == 1:
+            return self.frame_map[0]
+        idx = int(round(position))
+        idx = max(0, min(idx, len(self.frame_map) - 1))
+        return self.frame_map[idx]
 
     def _zoom_viewport(self, factor: float, anchor_percent: Optional[float] = None) -> None:
         start, end = self.viewport_range

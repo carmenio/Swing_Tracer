@@ -68,8 +68,6 @@ class VideoCanvas(QtWidgets.QWidget):
             self._press_pos = event.pos()
             self._last_pos = event.pos()
             self._dragging = False
-            if self._zoom > 1.0:
-                self.setCursor(QtCore.Qt.OpenHandCursor)
             event.accept()
         else:
             super().mousePressEvent(event)
@@ -81,7 +79,6 @@ class VideoCanvas(QtWidgets.QWidget):
                 distance = event.pos() - self._press_pos
                 if self._zoom > 1.0 and (abs(distance.x()) > 3 or abs(distance.y()) > 3):
                     self._dragging = True
-                    self.setCursor(QtCore.Qt.ClosedHandCursor)
             if self._dragging:
                 self._offset += QtCore.QPointF(delta)
                 self._clamp_offset()
@@ -94,7 +91,7 @@ class VideoCanvas(QtWidgets.QWidget):
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.LeftButton:
             if self._dragging:
-                self.setCursor(QtCore.Qt.CrossCursor if self._zoom <= 1.0 else QtCore.Qt.OpenHandCursor)
+                self.setCursor(QtCore.Qt.CrossCursor)
             else:
                 coords = self._map_to_frame(event.pos())
                 if coords:
@@ -106,7 +103,7 @@ class VideoCanvas(QtWidgets.QWidget):
 
     def leaveEvent(self, event: QtCore.QEvent) -> None:
         if not self._dragging:
-            self.setCursor(QtCore.Qt.CrossCursor if self._zoom <= 1.0 else QtCore.Qt.OpenHandCursor)
+            self.setCursor(QtCore.Qt.CrossCursor)
         super().leaveEvent(event)
 
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
@@ -115,7 +112,7 @@ class VideoCanvas(QtWidgets.QWidget):
         angle_delta = event.angleDelta().y()
         if angle_delta == 0:
             return
-        factor = 1.1 if angle_delta > 0 else 0.9
+        factor = 1.02 if angle_delta > 0 else 0.98
         new_zoom = max(self._min_zoom, min(self._max_zoom, self._zoom * factor))
         self._set_zoom(new_zoom, anchor=event.pos())
         event.accept()
@@ -124,10 +121,10 @@ class VideoCanvas(QtWidgets.QWidget):
     # Zoom / pan helpers
     # ------------------------------------------------------------------
     def zoom_in(self) -> None:
-        self._set_zoom(min(self._max_zoom, self._zoom * 1.2))
+        self._set_zoom(min(self._max_zoom, self._zoom * 1.05))
 
     def zoom_out(self) -> None:
-        self._set_zoom(max(self._min_zoom, self._zoom / 1.2))
+        self._set_zoom(max(self._min_zoom, self._zoom / 1.05))
 
     def reset_view(self) -> None:
         self._zoom = 1.0
@@ -162,7 +159,7 @@ class VideoCanvas(QtWidgets.QWidget):
         self._clamp_offset()
         self.update()
         self.zoom_changed.emit(self._zoom)
-        self.setCursor(QtCore.Qt.CrossCursor if self._zoom <= 1.0 else QtCore.Qt.OpenHandCursor)
+        self.setCursor(QtCore.Qt.CrossCursor)
 
     def _scaled_size(self) -> QtCore.QSizeF:
         if not self._pixmap:

@@ -33,9 +33,7 @@ class TrackedPoint:
     smoothed_position: Optional[Point2D] = None
     last_frame_index: Optional[int] = None
     absent_ranges: List[Tuple[int, int]] = field(default_factory=list)
-    stop_frames: Set[int] = field(default_factory=set)
-    start_frames: Set[int] = field(default_factory=set)
-    pending_stop_start: Optional[int] = None
+    open_absence_start: Optional[int] = None
 
     def record(self, frame_index: int, position: Optional[Point2D], confidence: float) -> None:
         if position is not None:
@@ -77,10 +75,6 @@ class TrackedPoint:
             else:
                 self.last_frame_index = None
                 self.smoothed_position = None
-        self.stop_frames = {frame for frame in self.stop_frames if frame <= frame_index}
-        self.start_frames = {frame for frame in self.start_frames if frame <= frame_index}
-        if self.pending_stop_start is not None and self.pending_stop_start > frame_index:
-            self.pending_stop_start = None
 
     def clear(self) -> None:
         self.positions.clear()
@@ -92,9 +86,7 @@ class TrackedPoint:
         self.smoothed_position = None
         self.last_frame_index = None
         self.absent_ranges.clear()
-        self.stop_frames.clear()
-        self.start_frames.clear()
-        self.pending_stop_start = None
+        self.open_absence_start = None
 
     def set_keyframe(self, frame_index: int, position: Point2D, *, accepted: bool = False) -> None:
         self.keyframes[frame_index] = position
@@ -123,10 +115,6 @@ class TrackedPoint:
         self.keyframes.pop(frame_index, None)
         self.accepted_keyframes.discard(frame_index)
         self.interpolation_cache.pop(frame_index, None)
-        self.start_frames.discard(frame_index)
-        if self.pending_stop_start == frame_index:
-            self.pending_stop_start = None
-        self.stop_frames.discard(frame_index)
         return True
 
     def pending_keyframe_frames(self) -> List[int]:
@@ -166,8 +154,11 @@ class TrackedPoint:
 
     def clear_absence_ranges(self) -> None:
         self.absent_ranges.clear()
+        self.open_absence_start = None
 
     def is_absent(self, frame_index: int) -> bool:
+        if self.open_absence_start is not None and frame_index >= self.open_absence_start:
+            return True
         for start, end in self.absent_ranges:
             if start <= frame_index <= end:
                 return True
@@ -175,6 +166,8 @@ class TrackedPoint:
 
     def end_absence_at(self, frame_index: int) -> None:
         updated: List[Tuple[int, int]] = []
+        if self.open_absence_start is not None and frame_index >= self.open_absence_start:
+            self.open_absence_start = None
         for start, end in self.absent_ranges:
             if frame_index < start:
                 updated.append((start, end))

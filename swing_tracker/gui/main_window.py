@@ -1,6 +1,7 @@
 import math
+from bisect import bisect_left
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import cv2
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -249,38 +250,11 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         header_layout.addStretch(1)
 
         self.load_button = self._build_primary_button("Load Video", "background-color: #1f1f1f;")
-        self.reset_button = self._build_primary_button("Reset", "background-color: #1f1f1f;")
         self.preprocess_button = self._build_primary_button("Preprocess", "background-color: #1f1f1f;")
         self.preprocess_button.setEnabled(False)
-        self.auto_track_toggle = QtWidgets.QToolButton()
-        self.auto_track_toggle.setText("Auto Track")
-        self.auto_track_toggle.setCheckable(True)
-        self.auto_track_toggle.setChecked(True)
-        self.auto_track_toggle.setCursor(QtCore.Qt.PointingHandCursor)
-        self.auto_track_toggle.setStyleSheet(
-            """
-            QToolButton {
-                border: 1px solid #2f2f2f;
-                border-radius: 14px;
-                padding: 6px 14px;
-                color: #f0f0f0;
-                background-color: rgba(255, 255, 255, 0.04);
-                font-weight: 500;
-            }
-            QToolButton:checked {
-                background-color: rgba(80, 200, 120, 0.25);
-                border-color: rgba(80, 200, 120, 0.6);
-            }
-            QToolButton:hover {
-                background-color: rgba(255, 255, 255, 0.14);
-            }
-            """
-        )
         self.settings_button = self._build_primary_button("Settings", "background-color: #1f1f1f;")
         header_layout.addWidget(self.load_button)
-        header_layout.addWidget(self.reset_button)
         header_layout.addWidget(self.preprocess_button)
-        header_layout.addWidget(self.auto_track_toggle)
         header_layout.addWidget(self.settings_button)
         main_layout.addLayout(header_layout)
 
@@ -300,8 +274,8 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
 
         # Playback bar
         main_layout.addWidget(self._build_playback_bar())
-        self.detailed_timeline.set_total_frames(0)
-        self.overview_timeline.set_total_frames(0)
+        self.detailed_timeline.set_frame_map([])
+        self.overview_timeline.set_frame_map([])
         self.detailed_timeline.set_viewport_range(*self.viewport_range)
         self.overview_timeline.set_viewport_range(*self.viewport_range)
 
@@ -453,61 +427,9 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
                 "set_button": set_button,
             }
 
-        self.clear_point_button = QtWidgets.QPushButton("Clear Selected Point History")
-        self.clear_point_button.setCursor(QtCore.Qt.PointingHandCursor)
-        self.clear_point_button.setStyleSheet(
-            """
-            QPushButton {
-                background-color: rgba(255, 255, 255, 0.05);
-                border: 1px dashed #2a2a2a;
-                border-radius: 12px;
-                font-size: 11px;
-                padding: 6px 10px;
-                color: #bbbbbb;
-            }
-            QPushButton:hover {
-                background-color: rgba(255, 255, 255, 0.12);
-            }
-            """
-        )
-        layout.addWidget(self.clear_point_button)
-
-        self.manage_off_frame_button = QtWidgets.QPushButton("Manage Off-Frame Ranges")
-        self.manage_off_frame_button.setCursor(QtCore.Qt.PointingHandCursor)
-        self.manage_off_frame_button.setStyleSheet(
-            """
-            QPushButton {
-                background-color: rgba(255, 255, 255, 0.05);
-                border: 1px solid #2a2a2a;
-                border-radius: 12px;
-                font-size: 11px;
-                padding: 6px 10px;
-                color: #dcdcdc;
-            }
-            QPushButton:hover {
-                background-color: rgba(255, 255, 255, 0.12);
-            }
-            """
-        )
-        layout.addWidget(self.manage_off_frame_button)
-
-        self.mark_stop_button = QtWidgets.QPushButton("Mark Stop Frame")
+        self.mark_stop_button = QtWidgets.QPushButton("Mark Off-Frame")
         self.mark_stop_button.setCursor(QtCore.Qt.PointingHandCursor)
-        self.mark_stop_button.setStyleSheet(
-            """
-            QPushButton {
-                background-color: rgba(255, 90, 90, 0.12);
-                border: 1px solid rgba(255, 90, 90, 0.4);
-                border-radius: 12px;
-                font-size: 11px;
-                padding: 6px 10px;
-                color: #ff9f9f;
-            }
-            QPushButton:hover {
-                background-color: rgba(255, 90, 90, 0.22);
-            }
-            """
-        )
+        self.mark_stop_button.setStyleSheet("")
         self.mark_stop_button.setEnabled(False)
         layout.addWidget(self.mark_stop_button)
 
@@ -683,7 +605,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
     def _setup_connections(self) -> None:
         self.load_button.clicked.connect(self.load_video)
-        self.reset_button.clicked.connect(self.stop_playback)
         self.preprocess_button.clicked.connect(self._preprocess_video)
 
         self.play_toggle.clicked.connect(self.toggle_playback)
@@ -695,12 +616,9 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self.overview_timeline.seekRequested.connect(self.seek_to_frame)
         self.overview_timeline.viewportChanged.connect(self._on_viewport_changed)
 
-        self.clear_point_button.clicked.connect(self._clear_selected_point_history)
-        self.manage_off_frame_button.clicked.connect(self._open_off_frame_dialog)
         self.mark_stop_button.clicked.connect(self._mark_stop_frame)
 
         self.issue_toggle_button.clicked.connect(self._toggle_issue_collapse)
-        self.auto_track_toggle.toggled.connect(self._set_auto_tracking_enabled)
         self.settings_button.clicked.connect(self._open_settings_dialog)
 
     # ------------------------------------------------------------------
@@ -735,8 +653,8 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self.total_time_label.setText(self._format_timestamp(duration_seconds))
         self.current_time_label.setText("0:00")
 
-        self.detailed_timeline.set_total_frames(metadata.frame_count)
-        self.overview_timeline.set_total_frames(metadata.frame_count)
+        self.detailed_timeline.set_frame_map([])
+        self.overview_timeline.set_frame_map([])
         self.overview_timeline.set_viewport_range(*self.viewport_range)
         self.detailed_timeline.set_viewport_range(*self.viewport_range)
         self.detailed_timeline.set_current_frame(0)
@@ -746,7 +664,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
 
         self.preprocess_button.setEnabled(True)
         self.play_toggle.setEnabled(True)
-        self.reset_button.setEnabled(True)
         self.mark_stop_button.setEnabled(True)
 
         self._initialize_points()
@@ -948,6 +865,10 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
                 history = [entry for entry in history if entry[0] >= min_frame]
             if len(history) < 2:
                 continue
+            stop_frames = {start for start, _ in tracked_point.absent_ranges}
+            if tracked_point.open_absence_start is not None:
+                stop_frames.add(tracked_point.open_absence_start)
+            start_frames = {end + 1 for _, end in tracked_point.absent_ranges}
             for idx in range(1, len(history)):
                 frame_idx = history[idx][0]
                 prev_pos = history[idx - 1][1]
@@ -957,7 +878,16 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
                 if ratio <= 0.0:
                     continue
                 alpha = max(30, int(255 * ratio))
-                color = QtGui.QColor(*tracked_point.color)
+                highlight = (
+                    frame_idx in stop_frames
+                    or frame_idx in start_frames
+                    or history[idx - 1][0] in stop_frames
+                    or history[idx - 1][0] in start_frames
+                )
+                if highlight:
+                    color = QtGui.QColor("#ff5c5c")
+                else:
+                    color = QtGui.QColor(*tracked_point.color)
                 color.setAlpha(alpha)
                 pen = QtGui.QPen(color, 2)
                 painter.setPen(pen)
@@ -1056,6 +986,61 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
                 }
                 """
             )
+
+        self._update_mark_stop_button_state()
+
+    def _update_mark_stop_button_state(self) -> None:
+        off_style = (
+            """
+            QPushButton {
+                background-color: rgba(255, 90, 90, 0.16);
+                border: 1px solid rgba(255, 90, 90, 0.55);
+                border-radius: 12px;
+                font-size: 11px;
+                padding: 6px 10px;
+                color: #ffb3b3;
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 90, 90, 0.26);
+            }
+            """
+        )
+        resume_style = (
+            """
+            QPushButton {
+                background-color: rgba(80, 200, 120, 0.18);
+                border: 1px solid rgba(80, 200, 120, 0.55);
+                border-radius: 12px;
+                font-size: 11px;
+                padding: 6px 10px;
+                color: #baf4d0;
+            }
+            QPushButton:hover {
+                background-color: rgba(80, 200, 120, 0.28);
+            }
+            """
+        )
+
+        if not self.video_player.is_loaded() or self.active_point is None:
+            self.mark_stop_button.setEnabled(False)
+            self.mark_stop_button.setText("Mark Off-Frame")
+            self.mark_stop_button.setStyleSheet(off_style)
+            return
+
+        tracked_point = self.custom_tracker.point_definitions().get(self.active_point)
+        if not tracked_point:
+            self.mark_stop_button.setEnabled(False)
+            self.mark_stop_button.setText("Mark Off-Frame")
+            self.mark_stop_button.setStyleSheet(off_style)
+            return
+
+        self.mark_stop_button.setEnabled(True)
+        if tracked_point.open_absence_start is not None:
+            self.mark_stop_button.setText("Mark Resume Frame")
+            self.mark_stop_button.setStyleSheet(resume_style)
+        else:
+            self.mark_stop_button.setText("Mark Off-Frame")
+            self.mark_stop_button.setStyleSheet(off_style)
 
     def _refresh_issue_panel(self) -> None:
         while self.issue_list_layout.count():
@@ -1202,6 +1187,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._refresh_point_statuses()
         self._update_timeline_markers()
         self._update_timeline_absences()
+        self._update_timeline_position(adjust_viewport=False)
 
     def _accept_pending_track(self, point_name: str, frame_index: int) -> None:
         if self.custom_tracker.accept_keyframe(point_name, frame_index):
@@ -1411,24 +1397,34 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         if not self.video_player.is_loaded():
             return
         if self.active_point is None:
-            QtWidgets.QMessageBox.information(self, "No Point Selected", "Select a point before marking a stop frame.")
+            QtWidgets.QMessageBox.information(
+                self,
+                "No Point Selected",
+                "Select a point before updating its off-frame status.",
+            )
             return
         tracked_point = self.custom_tracker.point_definitions().get(self.active_point)
         if not tracked_point:
             return
 
         frame_index = self.video_player.current_frame_index
-        if frame_index not in tracked_point.positions:
+        pending_start = tracked_point.open_absence_start
+        if pending_start is not None and frame_index <= pending_start:
             QtWidgets.QMessageBox.information(
                 self,
-                "Point Not Set",
-                "Set the point at this frame before marking it as a stop.",
+                "Move Forward",
+                "Move to a frame after the stop frame before marking the resume frame.",
             )
             return
 
         total_frames = self.video_player.metadata.frame_count if self.video_player.is_loaded() else frame_index + 1
         self._invalidate_preprocessing()
         if not self.custom_tracker.mark_stop_frame(self.active_point, frame_index, total_frames):
+            QtWidgets.QMessageBox.information(
+                self,
+                "Unable to Update",
+                "Select a valid frame before toggling the off-frame state.",
+            )
             return
 
         self._refresh_point_statuses()
@@ -1436,35 +1432,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._update_timeline_absences()
         if self.current_frame_bgr is not None:
             self._render_current_frame()
-
-    def _open_off_frame_dialog(self) -> None:
-        if self.active_point is None:
-            QtWidgets.QMessageBox.information(self, "No Point Selected", "Select a point to manage off-frame ranges.")
-            return
-        if not self.video_player.is_loaded():
-            QtWidgets.QMessageBox.information(self, "No Video Loaded", "Load a video before managing ranges.")
-            return
-        tracked_point = self.custom_tracker.point_definitions().get(self.active_point)
-        if not tracked_point:
-            return
-        metadata = self.video_player.metadata
-        dialog = OffFrameDialog(
-            self.active_point,
-            metadata.frame_count,
-            self.video_player.current_frame_index,
-            tracked_point.absent_ranges,
-            self,
-        )
-        if dialog.exec_() == QtWidgets.QDialog.Accepted:
-            ranges = dialog.ranges()
-            self._invalidate_preprocessing()
-            self.custom_tracker.set_point_absences(self.active_point, ranges)
-            self._refresh_issue_panel()
-            self._refresh_point_statuses()
-            self._update_timeline_markers()
-            if self.current_frame_bgr is not None:
-                self._render_current_frame()
-            self._update_timeline_absences()
 
     def _jump_to_issue(self, frame_index: int) -> None:
         if not self.video_player.is_loaded():
@@ -1493,11 +1460,18 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._update_timeline_position(adjust_viewport=False)
 
     def _ensure_viewport_contains_frame(self, frame_index: int) -> None:
-        if not self.video_player.is_loaded() or self.video_player.metadata.frame_count <= 1:
+        frames = self.detailed_timeline.frame_map
+        if not frames or len(frames) <= 1:
             return
 
-        total_span = float(self.video_player.metadata.frame_count - 1)
-        frame_percent = (frame_index / total_span) * 100.0
+        total_span = float(len(frames) - 1)
+        insert_index = bisect_left(frames, frame_index)
+        if insert_index >= len(frames):
+            insert_index = len(frames) - 1
+        elif frames[insert_index] != frame_index and insert_index > 0:
+            insert_index -= 1
+
+        frame_percent = (insert_index / total_span) * 100.0
         start, end = self.viewport_range
         width = max(5.0, end - start)
         changed = False
@@ -1526,9 +1500,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             end = min(100.0, start + 5.0)
         self.viewport_range = (start, end)
         self.auto_tracking_enabled = general.auto_track
-        self.auto_track_toggle.blockSignals(True)
-        self.auto_track_toggle.setChecked(general.auto_track)
-        self.auto_track_toggle.blockSignals(False)
         self.detailed_timeline.set_viewport_range(start, end)
         self.overview_timeline.set_viewport_range(start, end)
         self.overview_timeline.set_zoom_limits(
@@ -1559,15 +1530,35 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._update_timeline_markers()
         self._refresh_issue_panel()
 
+    def _manual_frame_map(self) -> List[int]:
+        if not self.video_player.is_loaded() or self.active_point is None:
+            return []
+        tracked_point = self.custom_tracker.point_definitions().get(self.active_point)
+        if not tracked_point:
+            return []
+        frame_set: Set[int] = set(tracked_point.keyframe_frames())
+        if tracked_point.open_absence_start is not None:
+            if (
+                tracked_point.open_absence_start in tracked_point.keyframes
+                or tracked_point.open_absence_start in tracked_point.positions
+            ):
+                frame_set.add(tracked_point.open_absence_start)
+        max_frame = (
+            self.video_player.metadata.frame_count - 1 if self.video_player.is_loaded() else None
+        )
+        if max_frame is not None:
+            frame_set = {frame for frame in frame_set if 0 <= frame <= max_frame}
+        return sorted(frame_set)
+
     def _update_timeline_position(self, adjust_viewport: bool = True) -> None:
-        total_frames = self.video_player.metadata.frame_count if self.video_player.is_loaded() else 0
+        frames = self._manual_frame_map()
+        self.detailed_timeline.set_frame_map(frames)
+        self.overview_timeline.set_frame_map(frames)
         current_frame = self.video_player.current_frame_index if self.video_player.is_loaded() else 0
 
         if adjust_viewport and self.video_player.is_loaded():
             self._ensure_viewport_contains_frame(current_frame)
 
-        self.detailed_timeline.set_total_frames(total_frames)
-        self.overview_timeline.set_total_frames(total_frames)
         self.detailed_timeline.set_viewport_range(*self.viewport_range)
         self.overview_timeline.set_viewport_range(*self.viewport_range)
         self.detailed_timeline.set_current_frame(current_frame)
@@ -1575,12 +1566,22 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
 
     def _update_timeline_markers(self) -> None:
         marker_map = self.custom_tracker.timeline_markers()
+        visible_frames = set(self.detailed_timeline.frame_map)
         markers: List[Tuple[int, QtGui.QColor]] = []
+        max_frame = None
+        if self.video_player.is_loaded():
+            frame_count = self.video_player.metadata.frame_count
+            if frame_count > 0:
+                max_frame = frame_count - 1
         for frame, category in marker_map.items():
+            if max_frame is not None and (frame < 0 or frame > max_frame):
+                continue
+            if visible_frames and frame not in visible_frames:
+                continue
             if category == "stop":
                 color = QtGui.QColor("#ff5c5c")
             elif category == "start":
-                color = QtGui.QColor("#ff5c5c")
+                color = QtGui.QColor("#64ffda")
             else:
                 color = QtGui.QColor("#32ff8a")
             markers.append((frame, color))
@@ -1594,6 +1595,12 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             tracked_point = self.custom_tracker.point_definitions().get(self.active_point)
             if tracked_point:
                 ranges = list(tracked_point.absent_ranges)
+                if tracked_point.open_absence_start is not None:
+                    metadata = self.video_player.metadata
+                    last_frame = metadata.frame_count - 1 if metadata.frame_count > 0 else self.video_player.current_frame_index
+                    last_frame = max(tracked_point.open_absence_start, last_frame)
+                    ranges.append((tracked_point.open_absence_start, last_frame))
+                ranges.sort(key=lambda item: item[0])
         self.detailed_timeline.set_absence_ranges(ranges)
         self.overview_timeline.set_absence_ranges(ranges)
 
@@ -1614,9 +1621,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self.settings.general.auto_track = enabled
         if not enabled:
             self._cancel_auto_track_task()
-        self.auto_track_toggle.blockSignals(True)
-        self.auto_track_toggle.setChecked(enabled)
-        self.auto_track_toggle.blockSignals(False)
         self.settings_manager.save()
 
     def _invalidate_preprocessing(self) -> None:

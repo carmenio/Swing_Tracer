@@ -143,9 +143,9 @@ class CustomPointTracker:
     def set_manual_point(self, frame_index: int, point_name: str, position: Point2D) -> None:
         tracked_point = self.points[point_name]
         was_absent = tracked_point.is_absent(frame_index)
-        pending_stop = tracked_point.pending_stop_start
+        open_start = tracked_point.open_absence_start
         tracked_point.remove_absence_at(frame_index)
-        if was_absent:
+        if was_absent and (open_start is None or frame_index < open_start):
             tracked_point.end_absence_at(frame_index)
         if self.truncate_future_on_manual_set:
             tracked_point.truncate_after(frame_index)
@@ -155,15 +155,6 @@ class CustomPointTracker:
         tracked_point.last_frame_index = frame_index
         self.current_positions[point_name] = position
         self.prev_gray = None
-        if pending_stop is not None:
-            if frame_index <= pending_stop:
-                tracked_point.stop_frames.discard(pending_stop)
-            else:
-                self._finalize_stop_range(tracked_point, frame_index)
-                tracked_point.stop_frames.discard(frame_index)
-            tracked_point.pending_stop_start = None
-        elif was_absent:
-            tracked_point.start_frames.add(frame_index)
 
     def clear_point_history(self, point_name: str) -> None:
         if point_name not in self.points:
@@ -186,9 +177,7 @@ class CustomPointTracker:
         if not tracked_point:
             return
         tracked_point.clear_absence_ranges()
-        tracked_point.stop_frames.clear()
-        tracked_point.start_frames.clear()
-        tracked_point.pending_stop_start = None
+        tracked_point.open_absence_start = None
         for start, end in sorted(ranges):
             start = max(0, start)
             end = max(start, end)
@@ -201,9 +190,6 @@ class CustomPointTracker:
         if not tracked_point:
             return
         tracked_point.clear_absence_ranges()
-        tracked_point.stop_frames.clear()
-        tracked_point.start_frames.clear()
-        tracked_point.pending_stop_start = None
         self.current_positions.pop(point_name, None)
 
     def point_absence_ranges(self, point_name: str) -> List[Tuple[int, int]]:
@@ -216,26 +202,29 @@ class CustomPointTracker:
         tracked_point = self.points.get(point_name)
         if not tracked_point:
             return False
-        pending = tracked_point.pending_stop_start
-        if pending is not None and frame_index > pending:
-            self._finalize_stop_range(tracked_point, frame_index)
+
+        max_index = total_frames - 1 if total_frames > 0 else frame_index
+        frame_index = max(0, min(frame_index, max_index))
+
+        current_start = tracked_point.open_absence_start
+        if current_start is None:
+            tracked_point.open_absence_start = frame_index
+            tracked_point.remove_absence_at(frame_index)
+            tracked_point.truncate_after(frame_index - 1)
+            self.current_positions.pop(point_name, None)
+            self.prev_gray = None
             return True
 
-        tracked_point.stop_frames.add(frame_index)
-        tracked_point.start_frames.discard(frame_index)
-        tracked_point.pending_stop_start = frame_index
+        if frame_index <= current_start:
+            return False
 
-        last_frame = total_frames - 1 if total_frames > 0 else frame_index
-        if last_frame >= frame_index + 1:
-            tracked_point.add_absence(frame_index + 1, last_frame)
-        else:
-            tracked_point.add_absence(frame_index + 1, frame_index + 1)
-
-        future_resume = self._next_keyframe_after(tracked_point, frame_index)
-        if future_resume is not None:
-            self._finalize_stop_range(tracked_point, future_resume)
-
-        # clear current position to avoid drawing stale points beyond stop
+        end_frame = frame_index - 1
+        absence_start = current_start + 1
+        if absence_start <= end_frame:
+            tracked_point.add_absence(absence_start, end_frame)
+            self._apply_absence_range(tracked_point, absence_start, end_frame)
+        tracked_point.open_absence_start = None
+        tracked_point.end_absence_at(frame_index)
         self.current_positions.pop(point_name, None)
         self.prev_gray = None
         return True
@@ -245,23 +234,13 @@ class CustomPointTracker:
         for tracked_point in self.points.values():
             for frame in tracked_point.accepted_keyframe_frames():
                 marker_map.setdefault(frame, "keyframe")
-            for frame in tracked_point.stop_frames:
-                marker_map[frame] = "stop"
-            for frame in tracked_point.start_frames:
-                marker_map[frame] = "start"
+            for start, end in tracked_point.absent_ranges:
+                marker_map[start] = "stop"
+                resume_frame = end + 1
+                marker_map[resume_frame] = "start"
+            if tracked_point.open_absence_start is not None:
+                marker_map[tracked_point.open_absence_start] = "stop"
         return marker_map
-    
-    def _next_keyframe_after(self, tracked_point: TrackedPoint, frame_index: int) -> Optional[int]:
-        future_keyframes = [frame for frame in tracked_point.keyframe_frames() if frame > frame_index]
-        return min(future_keyframes) if future_keyframes else None
-    
-    def _finalize_stop_range(self, tracked_point: TrackedPoint, resume_frame: int) -> None:
-        start = tracked_point.pending_stop_start
-        if start is None or resume_frame <= start:
-            return
-        tracked_point.start_frames.add(resume_frame)
-        tracked_point.end_absence_at(resume_frame)
-        tracked_point.pending_stop_start = None
 
     def point_definitions(self) -> Dict[str, TrackedPoint]:
         return self.points

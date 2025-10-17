@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Dict
+from typing import Dict, Optional
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -237,6 +237,27 @@ class SettingsDialog(QtWidgets.QDialog):
         theme_layout.addWidget(self.general_theme, 0, 1)
         layout.addLayout(theme_layout)
 
+        controls_group = QtWidgets.QGroupBox("Session Controls")
+        controls_layout = QtWidgets.QVBoxLayout(controls_group)
+        controls_layout.setSpacing(10)
+
+        self.control_reset_button = QtWidgets.QPushButton("Reset Session")
+        self.control_reset_button.setCursor(QtCore.Qt.PointingHandCursor)
+        self.control_reset_button.clicked.connect(self._handle_reset_session)
+        controls_layout.addWidget(self.control_reset_button)
+
+        self.control_auto_track_button = QtWidgets.QPushButton()
+        self.control_auto_track_button.setCursor(QtCore.Qt.PointingHandCursor)
+        self.control_auto_track_button.clicked.connect(self._handle_toggle_auto_track)
+        controls_layout.addWidget(self.control_auto_track_button)
+
+        self.control_clear_history_button = QtWidgets.QPushButton("Clear Selected Point History")
+        self.control_clear_history_button.setCursor(QtCore.Qt.PointingHandCursor)
+        self.control_clear_history_button.clicked.connect(self._handle_clear_point_history)
+        controls_layout.addWidget(self.control_clear_history_button)
+
+        layout.addWidget(controls_group)
+
         layout.addStretch(1)
         self.general_trail_slider.valueChanged.connect(
             lambda value: self.general_trail_value.setText(str(value))
@@ -453,6 +474,71 @@ class SettingsDialog(QtWidgets.QDialog):
         scroll.setWidget(container)
         return scroll
 
+    def _main_window(self) -> Optional[QtWidgets.QWidget]:
+        parent = self.parent()
+        if isinstance(parent, QtWidgets.QWidget):
+            return parent
+        return None
+
+    def _refresh_control_buttons(self) -> None:
+        main_window = self._main_window()
+        video_loaded = False
+        auto_tracking_enabled = self.settings.general.auto_track
+        active_point_available = False
+
+        if main_window is not None:
+            video_player = getattr(main_window, "video_player", None)
+            video_loaded = bool(video_player and getattr(video_player, "is_loaded", lambda: False)())
+            auto_tracking_enabled = bool(getattr(main_window, "auto_tracking_enabled", auto_tracking_enabled))
+            active_point = getattr(main_window, "active_point", None)
+            tracker = getattr(main_window, "custom_tracker", None)
+            if tracker and active_point and active_point in getattr(tracker, "point_definitions", lambda: {})():
+                active_point_available = True
+
+        self.control_reset_button.setEnabled(video_loaded)
+
+        if auto_tracking_enabled:
+            self.control_auto_track_button.setText("Disable Auto Track")
+        else:
+            self.control_auto_track_button.setText("Enable Auto Track")
+
+        self.general_auto_track.setChecked(auto_tracking_enabled)
+        self.settings.general.auto_track = auto_tracking_enabled
+
+        self.control_clear_history_button.setEnabled(active_point_available)
+        if not active_point_available:
+            self.control_clear_history_button.setToolTip("Select a point in the main window to clear its history.")
+        else:
+            active_point = getattr(main_window, "active_point", "")
+            self.control_clear_history_button.setToolTip(f"Clear history for {active_point}.")
+
+    def _handle_reset_session(self) -> None:
+        main_window = self._main_window()
+        if main_window and hasattr(main_window, "stop_playback"):
+            main_window.stop_playback()
+        self._refresh_control_buttons()
+
+    def _handle_toggle_auto_track(self) -> None:
+        main_window = self._main_window()
+        current_state = self.general_auto_track.isChecked()
+        if main_window and hasattr(main_window, "_set_auto_tracking_enabled"):
+            new_state = not current_state
+            main_window._set_auto_tracking_enabled(new_state)
+            self.general_auto_track.setChecked(new_state)
+            self.settings.general.auto_track = new_state
+        else:
+            # Fallback to toggling settings only
+            new_state = not current_state
+            self.general_auto_track.setChecked(new_state)
+            self.settings.general.auto_track = new_state
+        self._refresh_control_buttons()
+
+    def _handle_clear_point_history(self) -> None:
+        main_window = self._main_window()
+        if main_window and hasattr(main_window, "_clear_selected_point_history"):
+            main_window._clear_selected_point_history()
+        self._refresh_control_buttons()
+
     # ------------------------------------------------------------------
     # Helpers for building rows
     # ------------------------------------------------------------------
@@ -636,6 +722,8 @@ class SettingsDialog(QtWidgets.QDialog):
         idx = self.data_export_format.findText(ds.export_format)
         self.data_export_format.setCurrentIndex(max(0, idx))
         self.data_auto_save_interval.setValue(ds.auto_save_interval)
+
+        self._refresh_control_buttons()
 
     # ------------------------------------------------------------------
     # Actions
