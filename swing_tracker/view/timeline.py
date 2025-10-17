@@ -287,6 +287,7 @@ class DetailedTimeline(QtWidgets.QWidget):
         start_point: QtCore.QPointF,
         end_point: QtCore.QPointF,
     ) -> None:
+        print("run")
         if segment.accepted and segment.entity_colour:
             color = QtGui.QColor(segment.entity_colour)
             pen = QtGui.QPen(color, 3, cap=QtCore.Qt.RoundCap)
@@ -295,6 +296,7 @@ class DetailedTimeline(QtWidgets.QWidget):
             return
 
         color_stops = segment.color_stops()
+        print("DEBUG: _draw_segment_line: segment frames", segment.start_key.frame, segment.end_key.frame, "color_stops:", color_stops)
         if not color_stops:
             pen = QtGui.QPen(QtGui.QColor("#00ff00"), 3, cap=QtCore.Qt.RoundCap)
             painter.setPen(pen)
@@ -306,6 +308,7 @@ class DetailedTimeline(QtWidgets.QWidget):
         for frame, colour in color_stops:
             ratio = (frame - segment.start_key.frame) / span
             ratio = max(0.0, min(1.0, ratio))
+            print("DEBUG: _draw_segment_line: frame", frame, "ratio", ratio, "color", colour)
             gradient.setColorAt(ratio, QtGui.QColor(colour))
 
         pen = QtGui.QPen()

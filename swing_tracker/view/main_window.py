@@ -263,7 +263,7 @@ class SparklineWidget(QtWidgets.QWidget):
             threshold_ratio = min(1.0, max(0.0, self._threshold / max_value))
             threshold_y = rect.bottom() - threshold_ratio * rect.height()
             painter.setPen(QtGui.QPen(QtGui.QColor(255, 120, 90, 180), 1, QtCore.Qt.DashLine))
-            painter.drawLine(rect.left(), threshold_y, rect.right(), threshold_y)
+            painter.drawLine(rect.left(), int(threshold_y), rect.right(), int(threshold_y))
 
 
 class IssueRow(QtWidgets.QFrame):
