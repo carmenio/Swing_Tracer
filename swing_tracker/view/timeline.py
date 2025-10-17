@@ -1,11 +1,40 @@
-from bisect import bisect_left
-from typing import Any, Dict, Iterable, List, Optional, Tuple, cast
+import math
+import math
+from dataclasses import dataclass
+from bisect import bisect_left, bisect_right
+from typing import Any, Iterable, List, Optional, Tuple, cast
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 
 def clamp(value: float, min_value: float, max_value: float) -> float:
     return max(min_value, min(max_value, value))
+
+
+@dataclass
+class TimelineMarker:
+    frame: int
+    color: QtGui.QColor
+    category: str = "manual"
+
+
+def marker_line_color(marker: TimelineMarker) -> QtGui.QColor:
+    if marker.category in {"start", "stop"}:
+        color = QtGui.QColor(255, 80, 80)
+        color.setAlpha(150)
+        return color
+    color = QtGui.QColor(marker.color)
+    if marker.category == "provisional":
+        if color.alpha() > 190:
+            color.setAlpha(190)
+        return color
+    if marker.category == "auto" and color.alpha() > 170:
+        color.setAlpha(170)
+    elif marker.category == "interpolated" and color.alpha() > 140:
+        color.setAlpha(140)
+    elif marker.category not in {"auto", "interpolated"} and color.alpha() < 200:
+        color.setAlpha(200)
+    return color
 
 
 class DetailedTimeline(QtWidgets.QWidget):
@@ -15,18 +44,25 @@ class DetailedTimeline(QtWidgets.QWidget):
         super().__init__(parent)
         self.setMinimumHeight(36)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent, True)
 
         self.total_frames: int = 0
         self.current_frame: int = 0
         self.viewport_range: Tuple[float, float] = (0.0, 100.0)
-        self.markers: Dict[int, QtGui.QColor] = {}
+        self.markers: List[TimelineMarker] = []
         self.absence_ranges: List[Tuple[int, int]] = []
         self.frame_map: List[int] = []
-        self.frame_map: List[int] = []
-        self.frame_map: List[int] = []
-        self.frame_map: List[int] = []
+        self._marker_frames: List[int] = []
+        self._hit_regions: List[Tuple[int, QtCore.QPointF, float]] = []
 
         self._dragging: bool = False
+        self._highlight_frame: Optional[int] = None
+        self._highlight_opacity: float = 0.0
+        self._highlight_anim = QtCore.QVariantAnimation(self)
+        self._highlight_anim.setDuration(550)
+        self._highlight_anim.setEasingCurve(QtCore.QEasingCurve.OutQuad)
+        self._highlight_anim.valueChanged.connect(self._on_highlight_value_changed)
+        self._highlight_anim.finished.connect(self._on_highlight_finished)
 
     # ------------------------------------------------------------------
     # Public API
@@ -51,19 +87,30 @@ class DetailedTimeline(QtWidgets.QWidget):
             self.update()
 
     def set_markers(self, markers: Iterable[Any]) -> None:
-        new_markers: Dict[int, QtGui.QColor] = {}
+        parsed: List[TimelineMarker] = []
         for marker in markers:
+            if isinstance(marker, TimelineMarker):
+                parsed.append(
+                    TimelineMarker(int(marker.frame), QtGui.QColor(marker.color), marker.category)
+                )
+                continue
             if isinstance(marker, tuple) and len(marker) >= 2:
                 frame = int(marker[0])
                 color_value = marker[1]
                 color = QtGui.QColor(color_value) if not isinstance(color_value, QtGui.QColor) else color_value
-            else:
+                category = marker[2] if len(marker) >= 3 else "manual"
+                parsed.append(TimelineMarker(frame, QtGui.QColor(color), str(category)))
+                continue
+            try:
                 frame = int(marker)  # type: ignore[arg-type]
-                color = QtGui.QColor("#32ff8a")
-            frame = max(0, frame)
-            new_markers[frame] = color
-        if self.markers != new_markers:
-            self.markers = new_markers
+            except (TypeError, ValueError):
+                continue
+            parsed.append(TimelineMarker(frame, QtGui.QColor("#32ff8a"), "manual"))
+        parsed = [TimelineMarker(max(0, item.frame), item.color, item.category) for item in parsed]
+        parsed.sort(key=lambda item: item.frame)
+        if self.markers != parsed:
+            self.markers = parsed
+            self._marker_frames = [marker.frame for marker in parsed]
             self.update()
 
     def set_absence_ranges(self, ranges: Iterable[Tuple[int, int]]) -> None:
@@ -84,6 +131,22 @@ class DetailedTimeline(QtWidgets.QWidget):
             self.set_total_frames(len(unique))
             self.update()
 
+    def pulse_highlight(self, frame_index: int) -> None:
+        frame_index = max(0, int(frame_index))
+        self._highlight_frame = frame_index
+        self._highlight_anim.stop()
+        self._highlight_anim.setStartValue(1.0)
+        self._highlight_anim.setEndValue(0.0)
+        self._highlight_anim.start()
+        self.update()
+
+    def clear_highlight(self) -> None:
+        self._highlight_anim.stop()
+        if self._highlight_frame is not None or self._highlight_opacity > 0.0:
+            self._highlight_frame = None
+            self._highlight_opacity = 0.0
+            self.update()
+
     # ------------------------------------------------------------------
     # Painting
     # ------------------------------------------------------------------
@@ -100,16 +163,23 @@ class DetailedTimeline(QtWidgets.QWidget):
         painter.drawRoundedRect(content, 8, 8)
 
         if len(self.frame_map) <= 1:
+            self._hit_regions = []
             return
 
         start_index, end_index = self._viewport_indices()
         span = max(1.0, end_index - start_index)
+
+        view_start_frame, view_end_frame = self._viewport_frame_bounds()
 
         if self.absence_ranges:
             painter.save()
             painter.setPen(QtCore.Qt.NoPen)
             painter.setBrush(QtGui.QColor(255, 140, 105, 90))
             for start, end in self.absence_ranges:
+                if end < view_start_frame:
+                    continue
+                if start > view_end_frame:
+                    continue
                 start_pos = self._position_for_frame(start)
                 end_pos = self._position_for_frame(end + 1)
                 if start_pos is None or end_pos is None:
@@ -125,15 +195,64 @@ class DetailedTimeline(QtWidgets.QWidget):
                 painter.drawRect(QtCore.QRectF(left, content.top(), max(1.0, right - left), content.height()))
             painter.restore()
 
-        # Draw markers within viewport
-        for marker_frame, color in self.markers.items():
-            marker_pos = self._position_for_frame(marker_frame)
-            if marker_pos is None or marker_pos < start_index or marker_pos > end_index:
-                continue
-            percent = (marker_pos - start_index) / span
-            x = content.left() + percent * content.width()
-            painter.setPen(QtGui.QPen(color, 2))
-            painter.drawLine(QtCore.QPointF(x, content.top()), QtCore.QPointF(x, content.bottom()))
+        visible_markers = self._visible_markers_in_view(start_index, end_index, view_start_frame, view_end_frame)
+        if visible_markers:
+            visible_markers.sort(key=lambda item: item[1])
+            center_y = content.center().y()
+            self._hit_regions = []
+
+            # Draw connecting lines first
+            for idx in range(len(visible_markers) - 1):
+                marker, marker_pos = visible_markers[idx]
+                next_marker, next_pos = visible_markers[idx + 1]
+                start_percent = (marker_pos - start_index) / span
+                end_percent = (next_pos - start_index) / span
+                start_x = content.left() + start_percent * content.width()
+                end_x = content.left() + end_percent * content.width()
+                if end_x <= start_x:
+                    continue
+                line_color = marker_line_color(marker)
+                painter.setPen(QtGui.QPen(line_color, 3, cap=QtCore.Qt.RoundCap))
+                painter.drawLine(
+                    QtCore.QPointF(start_x, center_y),
+                    QtCore.QPointF(end_x, center_y),
+                )
+
+            # Draw individual markers
+            for marker, marker_pos in visible_markers:
+                percent = (marker_pos - start_index) / span
+                x = content.left() + percent * content.width()
+                point_color = QtGui.QColor(marker.color)
+                radius = 5.0 if marker.category == "manual" else 4.0
+                if marker.category == "provisional":
+                    radius = 5.5
+                    painter.setBrush(QtCore.Qt.NoBrush)
+                    painter.setPen(QtGui.QPen(point_color, 2))
+                else:
+                    painter.setBrush(point_color)
+                    painter.setPen(QtGui.QPen(QtGui.QColor("#050505"), 1))
+                if marker.category in {"start", "stop"}:
+                    radius = 6.0
+                    painter.setPen(QtGui.QPen(QtGui.QColor(255, 80, 80, 180), 2))
+                painter.drawEllipse(QtCore.QPointF(x, center_y), radius, radius)
+                self._hit_regions.append((marker.frame, QtCore.QPointF(x, center_y), radius + 3.0))
+        else:
+            self._hit_regions = []
+
+        if self._highlight_frame is not None and self._highlight_opacity > 0.0:
+            highlight_pos = self._position_for_frame(self._highlight_frame)
+            if highlight_pos is not None and start_index <= highlight_pos <= end_index:
+                percent = (highlight_pos - start_index) / span
+                x = content.left() + percent * content.width()
+                center_y = content.center().y()
+                alpha = int(200 * max(0.0, min(1.0, self._highlight_opacity)))
+                radius = 9.0 + 4.0 * (1.0 - self._highlight_opacity)
+                painter.save()
+                glow_color = QtGui.QColor(90, 210, 140, max(80, alpha))
+                painter.setPen(QtGui.QPen(glow_color, 2))
+                painter.setBrush(QtGui.QBrush(QtGui.QColor(glow_color.red(), glow_color.green(), glow_color.blue(), alpha)))
+                painter.drawEllipse(QtCore.QPointF(x, center_y), radius, radius)
+                painter.restore()
 
         # Draw playhead if inside viewport
         current_pos = self._position_for_frame(self.current_frame)
@@ -143,11 +262,29 @@ class DetailedTimeline(QtWidgets.QWidget):
             painter.setPen(QtGui.QPen(QtGui.QColor("#ffffff"), 2))
             painter.drawLine(QtCore.QPointF(x, content.top()), QtCore.QPointF(x, content.bottom()))
 
+    def _on_highlight_value_changed(self, value: object) -> None:
+        try:
+            self._highlight_opacity = float(value)
+        except (TypeError, ValueError):
+            self._highlight_opacity = 0.0
+        self.update()
+
+    def _on_highlight_finished(self) -> None:
+        self._highlight_opacity = 0.0
+        self._highlight_frame = None
+        self.update()
+
     # ------------------------------------------------------------------
     # Interaction
     # ------------------------------------------------------------------
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.LeftButton:
+            hit_frame = self._marker_hit_test(event.pos())
+            if hit_frame is not None:
+                self._dragging = False
+                self.seekRequested.emit(hit_frame)
+                event.accept()
+                return
             self._dragging = True
             self._seek_at(event.pos())
             event.accept()
@@ -187,6 +324,14 @@ class DetailedTimeline(QtWidgets.QWidget):
         if end_index <= start_index:
             end_index = start_index + 1.0
         return start_index, end_index
+
+    def _viewport_frame_bounds(self) -> Tuple[int, int]:
+        if not self.frame_map:
+            return (0, 0)
+        start_index, end_index = self._viewport_indices()
+        start_idx = max(0, int(math.floor(start_index)) - 1)
+        end_idx = min(len(self.frame_map) - 1, int(math.ceil(end_index)) + 1)
+        return self.frame_map[start_idx], self.frame_map[end_idx]
 
     def _position_for_frame(self, frame: float) -> Optional[float]:
         if not self.frame_map:
@@ -230,6 +375,38 @@ class DetailedTimeline(QtWidgets.QWidget):
         if actual_frame is not None:
             self.seekRequested.emit(actual_frame)
 
+    def _visible_markers_in_view(
+        self,
+        start_index: float,
+        end_index: float,
+        view_start_frame: int,
+        view_end_frame: int,
+    ) -> List[Tuple[TimelineMarker, float]]:
+        if not self.markers:
+            return []
+        if not self._marker_frames:
+            self._marker_frames = [marker.frame for marker in self.markers]
+        start_idx = bisect_left(self._marker_frames, view_start_frame)
+        end_idx = bisect_right(self._marker_frames, view_end_frame)
+        subset = self.markers[start_idx:end_idx]
+        visible: List[Tuple[TimelineMarker, float]] = []
+        for marker in subset:
+            marker_pos = self._position_for_frame(marker.frame)
+            if marker_pos is None or marker_pos < start_index or marker_pos > end_index:
+                continue
+            visible.append((marker, marker_pos))
+        return visible
+
+    def _marker_hit_test(self, pos: QtCore.QPoint) -> Optional[int]:
+        if not self._hit_regions:
+            return None
+        for frame, center, radius in self._hit_regions:
+            dx = pos.x() - center.x()
+            dy = pos.y() - center.y()
+            if (dx * dx + dy * dy) <= radius * radius:
+                return frame
+        return None
+
 
 class OverviewTimeline(QtWidgets.QWidget):
     seekRequested = QtCore.pyqtSignal(int)
@@ -247,7 +424,7 @@ class OverviewTimeline(QtWidgets.QWidget):
         self.total_frames: int = 0
         self.current_frame: int = 0
         self.viewport_range: Tuple[float, float] = (0.0, 100.0)
-        self.markers: Dict[int, QtGui.QColor] = {}
+        self.markers: List[TimelineMarker] = []
         self.absence_ranges: List[Tuple[int, int]] = []
         self.frame_map: List[int] = []
 
@@ -283,19 +460,29 @@ class OverviewTimeline(QtWidgets.QWidget):
             self.update()
 
     def set_markers(self, markers: Iterable[Any]) -> None:
-        new_markers: Dict[int, QtGui.QColor] = {}
+        parsed: List[TimelineMarker] = []
         for marker in markers:
+            if isinstance(marker, TimelineMarker):
+                parsed.append(
+                    TimelineMarker(int(marker.frame), QtGui.QColor(marker.color), marker.category)
+                )
+                continue
             if isinstance(marker, tuple) and len(marker) >= 2:
                 frame = int(marker[0])
                 color_value = marker[1]
                 color = QtGui.QColor(color_value) if not isinstance(color_value, QtGui.QColor) else color_value
-            else:
+                category = marker[2] if len(marker) >= 3 else "manual"
+                parsed.append(TimelineMarker(frame, QtGui.QColor(color), str(category)))
+                continue
+            try:
                 frame = int(marker)  # type: ignore[arg-type]
-                color = QtGui.QColor(50, 255, 138, 160)
-            frame = max(0, frame)
-            new_markers[frame] = color
-        if self.markers != new_markers:
-            self.markers = new_markers
+            except (TypeError, ValueError):
+                continue
+            parsed.append(TimelineMarker(frame, QtGui.QColor(50, 255, 138, 160), "manual"))
+        parsed = [TimelineMarker(max(0, item.frame), item.color, item.category) for item in parsed]
+        parsed.sort(key=lambda item: item.frame)
+        if self.markers != parsed:
+            self.markers = parsed
             self.update()
 
     def set_absence_ranges(self, ranges: Iterable[Tuple[int, int]]) -> None:
@@ -390,12 +577,13 @@ class OverviewTimeline(QtWidgets.QWidget):
             painter.restore()
 
         # Draw all markers with reduced opacity
-        for marker, color in self.markers.items():
-            marker_pos = self._position_for_frame(marker)
+        for marker in self.markers:
+            marker_pos = self._position_for_frame(marker.frame)
             if marker_pos is None:
                 continue
             percent = (marker_pos / total_span) if total_span else 0.0
             x = content.left() + percent * content.width()
+            color = marker_line_color(marker)
             painter.setPen(QtGui.QPen(color, 2))
             painter.drawLine(QtCore.QPointF(x, content.top()), QtCore.QPointF(x, content.bottom()))
 

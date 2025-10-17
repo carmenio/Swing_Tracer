@@ -1,18 +1,62 @@
 import math
 from bisect import bisect_left
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from ..model import AppSettings, Point2D, SettingsManager
+from ..model.video import VideoPlayer
+from ..model.video import VideoPlayer
 from ..model.tracking.custom_points import CustomPointFrameResult
 from .settings_dialog import SettingsDialog
 from .video_widget import VideoContainer
-from .timeline import DetailedTimeline, OverviewTimeline, clamp
+from .timeline import DetailedTimeline, OverviewTimeline, TimelineMarker, clamp
 
 if TYPE_CHECKING:  # pragma: no cover - for static analysis only
     from ..controller import SwingTrackerController
+
+
+class FrameDecodeWorker(QtCore.QObject):
+    frameReady = QtCore.pyqtSignal(int, object)
+    finished = QtCore.pyqtSignal()
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, player: VideoPlayer) -> None:
+        super().__init__()
+        self._player = player
+
+    @QtCore.pyqtSlot(int)
+    def advance(self, frames_to_advance: int) -> None:
+        try:
+            frame = self._player.advance(frames_to_advance)
+            frame_index = self._player.current_frame_index
+            self.frameReady.emit(frame_index, frame)
+        except Exception as exc:  # pragma: no cover - defensive
+            self.error.emit(str(exc))
+        finally:
+            self.finished.emit()
+
+
+class FrameDecodeWorker(QtCore.QObject):
+    frameReady = QtCore.pyqtSignal(int, object)
+    finished = QtCore.pyqtSignal()
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, player: VideoPlayer) -> None:
+        super().__init__()
+        self._player = player
+
+    @QtCore.pyqtSlot(int)
+    def advance(self, frames_to_advance: int) -> None:
+        try:
+            frame = self._player.advance(frames_to_advance)
+            frame_index = self._player.current_frame_index
+            self.frameReady.emit(frame_index, frame)
+        except Exception as exc:  # pragma: no cover - defensive
+            self.error.emit(str(exc))
+        finally:
+            self.finished.emit()
 
 
 class OffFrameDialog(QtWidgets.QDialog):
@@ -168,6 +212,75 @@ class OffFrameDialog(QtWidgets.QDialog):
         return self._merged_ranges()
 
 
+class SparklineWidget(QtWidgets.QWidget):
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(36)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self._values: List[float] = []
+        self._threshold: Optional[float] = None
+        self._max_value: float = 0.0
+
+    def set_samples(self, values: Sequence[float]) -> None:
+        self._values = list(values)
+        self._max_value = max(self._values) if self._values else 0.0
+        self.update()
+
+    def set_threshold(self, threshold: Optional[float]) -> None:
+        self._threshold = threshold
+        self.update()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+
+        rect = self.rect().adjusted(4, 4, -4, -4)
+        painter.setPen(QtGui.QPen(QtGui.QColor(40, 40, 40), 1))
+        painter.setBrush(QtGui.QColor(22, 22, 22))
+        painter.drawRoundedRect(rect, 8, 8)
+
+        if not self._values:
+            painter.setPen(QtGui.QPen(QtGui.QColor(90, 90, 90, 120), 1, QtCore.Qt.DashLine))
+            painter.drawLine(rect.bottomLeft(), rect.bottomRight())
+            return
+
+        max_value = self._max_value if self._max_value > 1e-6 else 1.0
+        count = len(self._values)
+        path = QtGui.QPainterPath()
+        for idx, value in enumerate(self._values):
+            x_ratio = idx / max(1, count - 1)
+            x = rect.left() + x_ratio * rect.width()
+            normalized = min(1.0, max(0.0, value / max_value))
+            y = rect.bottom() - normalized * rect.height()
+            if idx == 0:
+                path.moveTo(x, y)
+            else:
+                path.lineTo(x, y)
+        painter.setPen(QtGui.QPen(QtGui.QColor(90, 200, 255, 220), 1.8))
+        painter.drawPath(path)
+
+        if self._threshold is not None and max_value > 0:
+            threshold_ratio = min(1.0, max(0.0, self._threshold / max_value))
+            threshold_y = rect.bottom() - threshold_ratio * rect.height()
+            painter.setPen(QtGui.QPen(QtGui.QColor(255, 120, 90, 180), 1, QtCore.Qt.DashLine))
+            painter.drawLine(rect.left(), threshold_y, rect.right(), threshold_y)
+
+
+class IssueRow(QtWidgets.QFrame):
+    clicked = QtCore.pyqtSignal()
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class SwingTrackerWindow(QtWidgets.QMainWindow):
     def __init__(self, controller: "SwingTrackerController") -> None:
         super().__init__()
@@ -179,6 +292,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
 
         self.issues_collapsed: bool = False
 
+        self._speed_actions: List[QtWidgets.QAction] = []
         self._build_ui()
         self._setup_connections()
         self.auto_track_task: Optional[dict] = None
@@ -186,12 +300,29 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self.auto_track_timer.setInterval(0)
         self.auto_track_timer.timeout.connect(self._auto_track_step)
 
+        self.playback_timer = QtCore.QTimer(self)
+        self.playback_timer.setTimerType(QtCore.Qt.PreciseTimer)
+        self.playback_timer.timeout.connect(self._next_frame)
+        self.playback_speed: float = 1.0
+        self._playback_clock = QtCore.QElapsedTimer()
+        self._playback_accumulator: float = 0.0
+        self._decode_in_flight: bool = False
+
+        self._decoder_thread = QtCore.QThread(self)
+        self._decoder_thread.setObjectName("FrameDecodeThread")
+        self._decoder_worker = FrameDecodeWorker(self.video_player)
+        self._decoder_worker.moveToThread(self._decoder_thread)
+        self._decoder_worker.frameReady.connect(self._on_decode_frame_ready)
+        self._decoder_worker.finished.connect(self._on_decode_finished)
+        self._decoder_worker.error.connect(self._on_decode_error)
+        self._decoder_thread.start()
+
+        self._issue_items: List[Dict[str, Any]] = []
+        self._active_issue_frame: Optional[int] = None
+
         self._apply_settings_to_ui()
         self._refresh_issue_panel()
         self._refresh_point_statuses()
-
-        self.playback_timer = QtCore.QTimer(self)
-        self.playback_timer.timeout.connect(self._next_frame)
 
     # ------------------------------------------------------------------
     # Model-backed properties
@@ -619,22 +750,44 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         bottom_row = QtWidgets.QHBoxLayout()
         bottom_row.setSpacing(12)
 
-        self.playback_speed_button = QtWidgets.QPushButton("1x")
-        self.playback_speed_button.setFixedSize(50, 30)
+        self.playback_speed_button = QtWidgets.QToolButton()
+        self.playback_speed_button.setText("1x")
+        self.playback_speed_button.setFixedSize(60, 30)
+        self.playback_speed_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self.playback_speed_button = QtWidgets.QToolButton()
+        self.playback_speed_button.setText("1x")
+        self.playback_speed_button.setFixedSize(60, 30)
+        self.playback_speed_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         self.playback_speed_button.setStyleSheet(
             """
-            QPushButton {
+            QToolButton {
+            QToolButton {
                 background-color: #1f1f1f;
                 border: 1px solid #2f2f2f;
                 border-radius: 10px;
                 color: #f0f0f0;
                 font-size: 12px;
+                padding: 0 12px;
+                padding: 0 12px;
             }
-            QPushButton:hover {
+            QToolButton:hover {
+            QToolButton:hover {
                 background-color: #242424;
+            }
+            QToolButton::menu-indicator {
+                image: none;
+            }
+            QToolButton::menu-indicator {
+                image: none;
             }
             """
         )
+        self.playback_speed_menu = QtWidgets.QMenu(self.playback_speed_button)
+        self.playback_speed_button.setMenu(self.playback_speed_menu)
+        self._populate_speed_menu()
+        self.playback_speed_menu = QtWidgets.QMenu(self.playback_speed_button)
+        self.playback_speed_button.setMenu(self.playback_speed_menu)
+        self._populate_speed_menu()
         bottom_row.addWidget(self.playback_speed_button)
 
         self.overview_timeline = OverviewTimeline()
@@ -653,6 +806,34 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
     # Connections & helpers
     # ------------------------------------------------------------------
+    def _populate_speed_menu(self) -> None:
+        self.playback_speed_menu.clear()
+        self._speed_actions.clear()
+        for preset in [0.25, 0.5, 1.0, 2.0, 4.0]:
+            label = self._format_speed_text(preset)
+            action = self.playback_speed_menu.addAction(label)
+            action.setData(preset)
+            action.setCheckable(True)
+            action.triggered.connect(lambda checked, value=preset: self._set_playback_speed(value))
+            self._speed_actions.append(action)
+        self.playback_speed_menu.addSeparator()
+        custom_action = self.playback_speed_menu.addAction("Custom…")
+        custom_action.triggered.connect(self._prompt_custom_speed)
+
+    def _populate_speed_menu(self) -> None:
+        self.playback_speed_menu.clear()
+        self._speed_actions.clear()
+        for preset in [0.25, 0.5, 1.0, 2.0, 4.0]:
+            label = self._format_speed_text(preset)
+            action = self.playback_speed_menu.addAction(label)
+            action.setData(preset)
+            action.setCheckable(True)
+            action.triggered.connect(lambda checked, value=preset: self._set_playback_speed(value))
+            self._speed_actions.append(action)
+        self.playback_speed_menu.addSeparator()
+        custom_action = self.playback_speed_menu.addAction("Custom…")
+        custom_action.triggered.connect(self._prompt_custom_speed)
+
     def _setup_connections(self) -> None:
         self.load_button.clicked.connect(self.load_video)
         self.preprocess_button.clicked.connect(self._preprocess_video)
@@ -670,6 +851,67 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
 
         self.issue_toggle_button.clicked.connect(self._toggle_issue_collapse)
         self.settings_button.clicked.connect(self._open_settings_dialog)
+
+    def _format_speed_text(self, speed: float) -> str:
+        return f"{speed:g}x"
+
+    def _parse_speed_string(self, value: str) -> float:
+        try:
+            cleaned = value.strip().lower().replace("x", "")
+            return float(cleaned) if cleaned else 1.0
+        except ValueError:
+            return 1.0
+
+    def _set_playback_speed(self, speed: float, persist: bool = True) -> None:
+        clamped = max(0.05, min(16.0, float(speed)))
+        self.playback_speed = clamped
+        label = self._format_speed_text(clamped)
+        self.playback_speed_button.setText(label)
+        self._update_speed_menu_checks()
+        if persist:
+            self.settings.playback.default_speed = label
+            self.settings_manager.save()
+        if self.playback_timer.isActive():
+            self._reset_playback_clock()
+            self._playback_clock.start()
+
+    def _update_speed_menu_checks(self) -> None:
+        for action in self._speed_actions:
+            try:
+                action_value = float(action.data())
+            except (TypeError, ValueError):
+                action.setChecked(False)
+                continue
+            action.setChecked(abs(action_value - self.playback_speed) < 1e-3)
+
+    def _prompt_custom_speed(self) -> None:
+        speed, ok = QtWidgets.QInputDialog.getDouble(
+            self,
+            "Playback Speed",
+            "Speed multiplier:",
+            self.playback_speed,
+            0.05,
+            32.0,
+            2,
+        )
+        if ok:
+            self._set_playback_speed(speed)
+
+    def _reset_playback_clock(self) -> None:
+        self._playback_clock = QtCore.QElapsedTimer()
+        self._playback_accumulator = 0.0
+
+    def _queue_frame_advance(self, frames_to_advance: int) -> None:
+        if self._decode_in_flight:
+            return
+        frames = max(1, min(int(frames_to_advance), 16))
+        self._decode_in_flight = True
+        QtCore.QMetaObject.invokeMethod(
+            self._decoder_worker,
+            "advance",
+            QtCore.Qt.QueuedConnection,
+            QtCore.Q_ARG(int, frames),
+        )
 
     # ------------------------------------------------------------------
     # Video workflow
@@ -734,10 +976,23 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         if self.playback_timer.isActive():
             self.playback_timer.stop()
             self._update_play_button(False)
-        else:
-            interval = max(1, int(self.video_player.metadata.frame_duration_ms))
-            self.playback_timer.start(interval)
-            self._update_play_button(True)
+            self._decode_in_flight = False
+            self._reset_playback_clock()
+            return
+
+        if self.video_player.current_frame is None:
+            first_frame = self.video_player.read_first_frame()
+            if first_frame is None:
+                return
+            self._process_frame(first_frame, record=False)
+
+        self._reset_playback_clock()
+        self._playback_clock.start()
+        self._decode_in_flight = False
+        self.playback_timer.start(0)
+        self._queue_frame_advance(1)
+        self._playback_clock.restart()
+        self._update_play_button(True)
 
     def stop_playback(self) -> None:
         if not self.video_player.is_loaded():
@@ -745,6 +1000,10 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._cancel_auto_track_task()
         self.playback_timer.stop()
         self._update_play_button(False)
+        self._decode_in_flight = False
+        self._reset_playback_clock()
+        self._decode_in_flight = False
+        self._reset_playback_clock()
         self.video_player.reset()
         self.custom_tracker.reset()
         self.current_frame_bgr = None
@@ -758,10 +1017,11 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             self.video_container.show_placeholder()
             self._update_timeline_position()
 
-    def seek_to_frame(self, frame_index: int) -> None:
+    def seek_to_frame(self, frame_index: int, resume_playback: bool = False) -> None:
         if not self.video_player.is_loaded():
             return
 
+        was_playing = self.playback_timer.isActive()
         self._cancel_auto_track_task()
 
         frame = self.video_player.seek(frame_index)
@@ -770,21 +1030,72 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
 
         self.playback_timer.stop()
         self._update_play_button(False)
+        self._decode_in_flight = False
+        self._decode_in_flight = False
         self._process_frame(frame, record=False)
+        self._reset_playback_clock()
+
+        if resume_playback and was_playing:
+            self.toggle_playback()
 
     def _next_frame(self) -> None:
         if not self.video_player.is_loaded():
             self.playback_timer.stop()
             self._update_play_button(False)
+            self._decode_in_flight = False
             return
 
-        frame = self.video_player.read_next()
+        if self._decode_in_flight:
+            return
+
+        fps = self.video_player.metadata.fps or 30.0
+        if fps <= 0:
+            fps = 30.0
+        frame_duration = 1000.0 / fps
+
+        elapsed = self._playback_clock.restart()
+        self._playback_accumulator += elapsed * self.playback_speed
+        frames_ready = int(self._playback_accumulator / frame_duration)
+        if frames_ready <= 0:
+            return
+
+        frames_to_request = max(1, min(frames_ready, 16))
+        self._playback_accumulator -= frames_to_request * frame_duration
+        self._queue_frame_advance(frames_to_request)
+
+    @QtCore.pyqtSlot(int, object)
+    def _on_decode_frame_ready(self, frame_index: int, frame_data: object) -> None:
+        if frame_data is None:
+            self.playback_timer.stop()
+            self._update_play_button(False)
+            self._decode_in_flight = False
+            self._reset_playback_clock()
+            return
+
+        if not self.playback_timer.isActive():
+            self._decode_in_flight = False
+            return
+
+        frame = frame_data if frame_data is not None else self.video_player.current_frame
         if frame is None:
             self.playback_timer.stop()
             self._update_play_button(False)
+            self._decode_in_flight = False
+            self._reset_playback_clock()
             return
 
+        # VideoPlayer.advance already updates current_frame/current_frame_index.
         self._process_frame(frame, record=True)
+
+    @QtCore.pyqtSlot()
+    def _on_decode_finished(self) -> None:
+        self._decode_in_flight = False
+
+    @QtCore.pyqtSlot(str)
+    def _on_decode_error(self, message: str) -> None:
+        # Log decode errors without interrupting the UI flow.
+        QtCore.qWarning(f"Frame decode error: {message}")
+        self._decode_in_flight = False
 
     # ------------------------------------------------------------------
     # Preprocessing & tracking
@@ -1099,127 +1410,336 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             if widget:
                 widget.deleteLater()
 
-        pending = self.custom_tracker.pending_keyframes()
-        total_pending = sum(len(frames) for frames in pending.values())
+        total_pending = 0
+        if self.video_player.is_loaded():
+            for point in self.point_definitions.keys():
+                total_pending += self.custom_tracker.count_provisionals(point)
         self.issue_count_badge.setText(str(total_pending))
 
-        if total_pending == 0:
-            placeholder = QtWidgets.QLabel("All tracked points accepted.")
+        self._issue_items = []
+
+        if not self.video_player.is_loaded() or not self.active_point:
+            placeholder = QtWidgets.QLabel("Load a video and select a point to review tracking suggestions.")
+            placeholder.setWordWrap(True)
             placeholder.setAlignment(QtCore.Qt.AlignCenter)
-            placeholder.setStyleSheet("color: #6f6f6f; font-size: 12px; padding: 12px 0;")
+            placeholder.setStyleSheet("color: #6f6f6f; font-size: 12px; padding: 16px 8px;")
             self.issue_list_layout.addWidget(placeholder)
             self.issue_list_layout.addStretch(1)
+            self._active_issue_frame = None
+            self.detailed_timeline.clear_highlight()
+            self._update_issue_selection_styles()
             self._update_timeline_markers()
             return
 
-        for point_name in self.point_definitions.keys():
-            frames = pending.get(point_name)
-            if not frames:
-                continue
+        current_frame = self.video_player.current_frame_index
+        chain = self.custom_tracker.provisional_chain_for_frame(self.active_point, current_frame)
+        provisionals = chain.provisionals() if chain else []
 
-            frame_index = frames[0]
-            additional = len(frames) - 1
-            row = QtWidgets.QFrame()
-            row.setStyleSheet(
-                """
-                QFrame {
-                    background-color: rgba(255, 255, 255, 0.05);
-                    border-radius: 12px;
-                }
-                """
+        if not provisionals:
+            placeholder = QtWidgets.QLabel("No provisional key points detected in this 50-frame span.")
+            placeholder.setAlignment(QtCore.Qt.AlignCenter)
+            placeholder.setStyleSheet("color: #6f6f6f; font-size: 12px; padding: 16px 8px;")
+            self.issue_list_layout.addWidget(placeholder)
+            self.issue_list_layout.addStretch(1)
+            self._active_issue_frame = None
+            self.detailed_timeline.clear_highlight()
+            self._update_issue_selection_styles()
+            self._update_timeline_markers()
+            return
+
+        header = QtWidgets.QFrame()
+        header.setStyleSheet(
+            """
+            QFrame {
+                background-color: rgba(255, 255, 255, 0.04);
+                border-radius: 10px;
+            }
+            """
+        )
+        header_layout = QtWidgets.QHBoxLayout(header)
+        header_layout.setContentsMargins(10, 6, 10, 6)
+        header_layout.setSpacing(8)
+
+        span_label = QtWidgets.QLabel(f"Span F{chain.span_start} – F{chain.span_end}")
+        span_label.setStyleSheet("color: #f0f0f0; font-size: 12px; font-weight: 600;")
+        header_layout.addWidget(span_label)
+
+        header_layout.addStretch(1)
+
+        accept_all = QtWidgets.QPushButton("Accept All Shown")
+        accept_all.setCursor(QtCore.Qt.PointingHandCursor)
+        accept_all.setStyleSheet(
+            """
+            QPushButton {
+                background-color: rgba(80, 200, 120, 0.2);
+                border: 1px solid rgba(80, 200, 120, 0.4);
+                border-radius: 12px;
+                font-size: 11px;
+                padding: 4px 10px;
+                color: #c8f7da;
+            }
+            QPushButton:hover {
+                background-color: rgba(80, 200, 120, 0.3);
+            }
+            """
+        )
+        accept_all.clicked.connect(
+            lambda _, p=self.active_point, span=(chain.span_start, chain.span_end): self._accept_all_provisionals(p, span)
+        )
+        header_layout.addWidget(accept_all)
+
+        reject_all = QtWidgets.QPushButton("Reject All Shown")
+        reject_all.setCursor(QtCore.Qt.PointingHandCursor)
+        reject_all.setStyleSheet(
+            """
+            QPushButton {
+                background-color: rgba(220, 80, 80, 0.18);
+                border: 1px solid rgba(220, 80, 80, 0.35);
+                border-radius: 12px;
+                font-size: 11px;
+                padding: 4px 10px;
+                color: #ffc7c7;
+            }
+            QPushButton:hover {
+                background-color: rgba(220, 80, 80, 0.28);
+            }
+            """
+        )
+        reject_all.clicked.connect(
+            lambda _, p=self.active_point, span=(chain.span_start, chain.span_end): self._reject_all_provisionals(p, span)
+        )
+        header_layout.addWidget(reject_all)
+
+        self.issue_list_layout.addWidget(header)
+
+        sorted_candidates = sorted(provisionals, key=lambda c: c.anchor.frame)
+        for candidate in sorted_candidates:
+            row, metadata = self._build_provisional_row(
+                self.active_point,
+                (chain.span_start, chain.span_end),
+                chain,
+                candidate,
             )
-            row_layout = QtWidgets.QHBoxLayout(row)
-            row_layout.setContentsMargins(10, 6, 10, 6)
-            row_layout.setSpacing(8)
-
-            color = self.point_definitions.get(point_name, (255, 255, 255))
-            indicator = QtWidgets.QLabel()
-            indicator.setFixedSize(10, 10)
-            indicator.setStyleSheet(f"background-color: rgb({color[0]}, {color[1]}, {color[2]}); border-radius: 5px;")
-            row_layout.addWidget(indicator)
-
-            name_label = QtWidgets.QLabel(point_name)
-            name_label.setStyleSheet("font-size: 12px; color: #f0f0f0;")
-            row_layout.addWidget(name_label, stretch=1)
-
-            frame_text = f"F{frame_index}" if additional <= 0 else f"F{frame_index} (+{additional})"
-            frame_label = QtWidgets.QLabel(frame_text)
-            frame_label.setStyleSheet("color: #bbbbbb; font-size: 12px;")
-            row_layout.addWidget(frame_label)
-
-            accept_button = QtWidgets.QPushButton("Accept")
-            accept_button.setCursor(QtCore.Qt.PointingHandCursor)
-            accept_button.setFixedWidth(64)
-            accept_button.setStyleSheet(
-                """
-                QPushButton {
-                    background-color: rgba(80, 200, 120, 0.25);
-                    border: 1px solid rgba(80, 200, 120, 0.45);
-                    border-radius: 12px;
-                    font-size: 11px;
-                    padding: 3px 0;
-                    color: #c8f7da;
-                }
-                QPushButton:hover {
-                    background-color: rgba(80, 200, 120, 0.35);
-                }
-                """
-            )
-            accept_button.clicked.connect(
-                lambda _, p=point_name, f=frame_index: self._accept_pending_track(p, f)
-            )
-            row_layout.addWidget(accept_button)
-
-            reject_button = QtWidgets.QPushButton("Reject")
-            reject_button.setCursor(QtCore.Qt.PointingHandCursor)
-            reject_button.setFixedWidth(60)
-            reject_button.setStyleSheet(
-                """
-                QPushButton {
-                    background-color: rgba(220, 80, 80, 0.2);
-                    border: 1px solid rgba(220, 80, 80, 0.35);
-                    border-radius: 12px;
-                    font-size: 11px;
-                    padding: 3px 0;
-                    color: #ffc7c7;
-                }
-                QPushButton:hover {
-                    background-color: rgba(220, 80, 80, 0.3);
-                }
-                """
-            )
-            reject_button.clicked.connect(
-                lambda _, p=point_name, f=frame_index: self._reject_pending_track(p, f)
-            )
-            row_layout.addWidget(reject_button)
-
-            set_button = QtWidgets.QPushButton("Set New")
-            set_button.setCursor(QtCore.Qt.PointingHandCursor)
-            set_button.setFixedWidth(68)
-            set_button.setStyleSheet(
-                """
-                QPushButton {
-                    background-color: rgba(255, 255, 255, 0.08);
-                    border: 1px dashed #2f2f2f;
-                    border-radius: 12px;
-                    font-size: 11px;
-                    padding: 3px 0;
-                    color: #f0f0f0;
-                }
-                QPushButton:hover {
-                    background-color: rgba(255, 255, 255, 0.16);
-                }
-                """
-            )
-            set_button.clicked.connect(
-                lambda _, p=point_name, f=frame_index: self._review_pending_track(p, f)
-            )
-            row_layout.addWidget(set_button)
-
+            self._issue_items.append(metadata)
             self.issue_list_layout.addWidget(row)
 
+        frames_present = {item["frame"] for item in self._issue_items}
+        if self._active_issue_frame is not None and self._active_issue_frame not in frames_present:
+            self._active_issue_frame = None
+
         self.issue_list_layout.addStretch(1)
+        self._update_issue_selection_styles()
         self._update_timeline_markers()
+
+    def _build_provisional_row(
+        self,
+        point_name: str,
+        span: Tuple[int, int],
+        chain,
+        candidate,
+    ) -> Tuple[IssueRow, Dict[str, Any]]:
+        row = IssueRow()
+        row.setProperty("selected", False)
+        row.setStyleSheet(
+            """
+            QFrame {
+                background-color: rgba(255, 255, 255, 0.05);
+                border-radius: 14px;
+                border: 1px solid rgba(255, 255, 255, 0.06);
+            }
+            QFrame[selected="true"] {
+                border: 1px solid rgba(80, 200, 120, 0.6);
+                background-color: rgba(80, 200, 120, 0.18);
+            }
+            """
+        )
+        layout = QtWidgets.QHBoxLayout(row)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(10)
+
+        base_color = self.point_definitions.get(point_name, (255, 255, 255))
+        indicator = QtWidgets.QLabel()
+        indicator.setFixedSize(12, 12)
+        indicator.setStyleSheet(
+            f"background-color: rgb({base_color[0]}, {base_color[1]}, {base_color[2]}); border-radius: 6px;"
+        )
+        layout.addWidget(indicator)
+
+        info_layout = QtWidgets.QVBoxLayout()
+        info_layout.setContentsMargins(0, 0, 0, 0)
+        info_layout.setSpacing(2)
+
+        frame_label = QtWidgets.QLabel(f"Frame {candidate.anchor.frame}")
+        frame_label.setStyleSheet("color: #f0f0f0; font-size: 12px; font-weight: 600;")
+        info_layout.addWidget(frame_label)
+
+        residual = candidate.anchor.residual
+        confidence_pct = candidate.anchor.confidence * 100.0
+        fb_error = candidate.anchor.fb_error
+        metrics_label = QtWidgets.QLabel(
+            f"Residual {residual:.1f}px • Confidence {confidence_pct:.0f}% • FB {fb_error:.2f}"
+        )
+        metrics_label.setStyleSheet("color: #bcbcbc; font-size: 11px;")
+        info_layout.addWidget(metrics_label)
+
+        layout.addLayout(info_layout, stretch=1)
+
+        sparkline = SparklineWidget()
+        sparkline.setFixedWidth(160)
+        tail_residuals = candidate.tail.residuals if candidate.tail else []
+        sparkline.set_samples(tail_residuals)
+        sparkline.set_threshold(chain.threshold_pixels)
+        layout.addWidget(sparkline)
+
+        button_column = QtWidgets.QVBoxLayout()
+        button_column.setContentsMargins(0, 0, 0, 0)
+        button_column.setSpacing(4)
+
+        jump_button = QtWidgets.QPushButton("Jump")
+        jump_button.setCursor(QtCore.Qt.PointingHandCursor)
+        jump_button.setStyleSheet(
+            """
+            QPushButton {
+                background-color: rgba(255, 255, 255, 0.08);
+                border: 1px solid rgba(255, 255, 255, 0.18);
+                border-radius: 10px;
+                font-size: 11px;
+                padding: 3px 10px;
+                color: #f0f0f0;
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 255, 255, 0.16);
+            }
+            """
+        )
+        row.clicked.connect(lambda f=candidate.anchor.frame: self._focus_issue(f))
+        jump_button.clicked.connect(lambda _, f=candidate.anchor.frame: self._focus_issue(f))
+        button_column.addWidget(jump_button)
+
+        accept_button = QtWidgets.QPushButton("Accept")
+        accept_button.setCursor(QtCore.Qt.PointingHandCursor)
+        accept_button.setStyleSheet(
+            """
+            QPushButton {
+                background-color: rgba(80, 200, 120, 0.25);
+                border: 1px solid rgba(80, 200, 120, 0.45);
+                border-radius: 10px;
+                font-size: 11px;
+                padding: 3px 10px;
+                color: #c8f7da;
+            }
+            QPushButton:hover {
+                background-color: rgba(80, 200, 120, 0.35);
+            }
+            """
+        )
+        accept_button.clicked.connect(
+            lambda _, p=point_name, sp=span, f=candidate.anchor.frame: self._accept_provisional_candidate(p, sp, f)
+        )
+        button_column.addWidget(accept_button)
+
+        reject_button = QtWidgets.QPushButton("Reject")
+        reject_button.setCursor(QtCore.Qt.PointingHandCursor)
+        reject_button.setStyleSheet(
+            """
+            QPushButton {
+                background-color: rgba(220, 80, 80, 0.2);
+                border: 1px solid rgba(220, 80, 80, 0.35);
+                border-radius: 10px;
+                font-size: 11px;
+                padding: 3px 10px;
+                color: #ffc7c7;
+            }
+            QPushButton:hover {
+                background-color: rgba(220, 80, 80, 0.3);
+            }
+            """
+        )
+        reject_button.clicked.connect(
+            lambda _, p=point_name, sp=span, f=candidate.anchor.frame: self._reject_provisional_candidate(p, sp, f)
+        )
+        button_column.addWidget(reject_button)
+
+        layout.addLayout(button_column)
+
+        metadata = {
+            "row": row,
+            "frame": candidate.anchor.frame,
+            "span": span,
+            "point": point_name,
+        }
+        return row, metadata
+
+    def _accept_provisional_candidate(self, point_name: str, span: Tuple[int, int], frame_index: int) -> None:
+        if self.custom_tracker.accept_provisional(point_name, span, frame_index):
+            self._update_timeline_markers()
+            self._refresh_issue_panel()
+            self._advance_to_next_issue(frame_index)
+
+    def _reject_provisional_candidate(self, point_name: str, span: Tuple[int, int], frame_index: int) -> None:
+        if self.custom_tracker.reject_provisional(point_name, span, frame_index):
+            self._update_timeline_markers()
+            self._refresh_issue_panel()
+            self._advance_to_next_issue(frame_index, pause_when_empty=True)
+
+    def _accept_all_provisionals(self, point_name: str, span: Tuple[int, int]) -> None:
+        if self.custom_tracker.accept_all_provisionals(point_name, span):
+            self._update_timeline_markers()
+            self._refresh_issue_panel()
+            self._advance_to_next_issue(span[1])
+
+    def _reject_all_provisionals(self, point_name: str, span: Tuple[int, int]) -> None:
+        if self.custom_tracker.reject_all_provisionals(point_name, span):
+            self._update_timeline_markers()
+            self._refresh_issue_panel()
+            self._advance_to_next_issue(span[1], pause_when_empty=True)
+
+    def _focus_issue(self, frame_index: int) -> None:
+        if not self.video_player.is_loaded():
+            return
+        was_playing = self.playback_timer.isActive()
+        self._active_issue_frame = frame_index
+        self.seek_to_frame(frame_index, resume_playback=was_playing)
+        self._ensure_viewport_contains_frame(frame_index)
+        self.detailed_timeline.pulse_highlight(frame_index)
+        self._update_issue_selection_styles()
+
+    def _advance_to_next_issue(self, previous_frame: int, pause_when_empty: bool = False) -> None:
+        if not self._issue_items:
+            self._handle_no_remaining_issues(pause_when_empty)
+            return
+        sorted_items = sorted(self._issue_items, key=lambda item: item["frame"])
+        next_item = next((item for item in sorted_items if item["frame"] > previous_frame), None)
+        if not next_item:
+            self._handle_no_remaining_issues(pause_when_empty)
+            return
+        self._focus_issue(next_item["frame"])
+
+    def _handle_no_remaining_issues(self, pause_playback: bool) -> None:
+        self._active_issue_frame = None
+        self._update_issue_selection_styles()
+        self.detailed_timeline.clear_highlight()
+        if pause_playback and self.playback_timer.isActive():
+            self.playback_timer.stop()
+            self._update_play_button(False)
+            self._decode_in_flight = False
+            self._reset_playback_clock()
+        self._notify_no_remaining_issues()
+
+    def _notify_no_remaining_issues(self) -> None:
+        message = "No remaining key points to review"
+        global_pos = self.mapToGlobal(self.rect().center())
+        QtWidgets.QToolTip.showText(global_pos, message, self, self.rect(), 2000)
+
+    def _update_issue_selection_styles(self) -> None:
+        for item in self._issue_items:
+            row = item.get("row")
+            if not isinstance(row, QtWidgets.QFrame):
+                continue
+            selected = item.get("frame") == self._active_issue_frame
+            row.setProperty("selected", bool(selected))
+            row.style().unpolish(row)
+            row.style().polish(row)
 
     def _toggle_issue_collapse(self) -> None:
         self.issues_collapsed = not self.issues_collapsed
@@ -1238,22 +1758,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._update_timeline_markers()
         self._update_timeline_absences()
         self._update_timeline_position(adjust_viewport=False)
-
-    def _accept_pending_track(self, point_name: str, frame_index: int) -> None:
-        if self.custom_tracker.accept_keyframe(point_name, frame_index):
-            self._update_timeline_markers()
-            self._refresh_issue_panel()
-
-    def _reject_pending_track(self, point_name: str, frame_index: int) -> None:
-        if self.custom_tracker.reject_keyframe(point_name, frame_index):
-            self._refresh_issue_panel()
-
-    def _review_pending_track(self, point_name: str, frame_index: int) -> None:
-        self._set_active_point(point_name)
-        if self.playback_timer.isActive():
-            self.playback_timer.stop()
-            self._update_play_button(False)
-        self.seek_to_frame(frame_index)
 
     def _auto_track_forward(self, point_name: str) -> None:
         if not self.video_player.is_loaded() or not self.auto_tracking_enabled:
@@ -1484,9 +1988,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             self._render_current_frame()
 
     def _jump_to_issue(self, frame_index: int) -> None:
-        if not self.video_player.is_loaded():
-            return
-        self.seek_to_frame(frame_index)
+        self._focus_issue(frame_index)
 
     # ------------------------------------------------------------------
     # Utility helpers
@@ -1563,7 +2065,8 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self.overview_timeline.setMinimumHeight(overview_height)
         self.overview_timeline.setMaximumHeight(overview_height)
         self.custom_tracker.update_from_settings(self.settings.tracking)
-        self.playback_speed_button.setText(self.settings.playback.default_speed)
+        default_speed = self._parse_speed_string(self.settings.playback.default_speed)
+        self._set_playback_speed(default_speed, persist=False)
         self._update_timeline_position(adjust_viewport=False)
         self._update_timeline_absences()
 
@@ -1580,28 +2083,16 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._update_timeline_markers()
         self._refresh_issue_panel()
 
-    def _manual_frame_map(self) -> List[int]:
-        if not self.video_player.is_loaded() or self.active_point is None:
+    def _timeline_frame_map(self) -> List[int]:
+        if not self.video_player.is_loaded():
             return []
-        tracked_point = self.custom_tracker.point_definitions().get(self.active_point)
-        if not tracked_point:
+        frame_count = self.video_player.metadata.frame_count
+        if frame_count <= 0:
             return []
-        frame_set: Set[int] = set(tracked_point.keyframe_frames())
-        if tracked_point.open_absence_start is not None:
-            if (
-                tracked_point.open_absence_start in tracked_point.keyframes
-                or tracked_point.open_absence_start in tracked_point.positions
-            ):
-                frame_set.add(tracked_point.open_absence_start)
-        max_frame = (
-            self.video_player.metadata.frame_count - 1 if self.video_player.is_loaded() else None
-        )
-        if max_frame is not None:
-            frame_set = {frame for frame in frame_set if 0 <= frame <= max_frame}
-        return sorted(frame_set)
+        return list(range(frame_count))
 
     def _update_timeline_position(self, adjust_viewport: bool = True) -> None:
-        frames = self._manual_frame_map()
+        frames = self._timeline_frame_map()
         self.detailed_timeline.set_frame_map(frames)
         self.overview_timeline.set_frame_map(frames)
         current_frame = self.video_player.current_frame_index if self.video_player.is_loaded() else 0
@@ -1615,27 +2106,78 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self.overview_timeline.set_current_frame(current_frame)
 
     def _update_timeline_markers(self) -> None:
-        marker_map = self.custom_tracker.timeline_markers()
-        visible_frames = set(self.detailed_timeline.frame_map)
-        markers: List[Tuple[int, QtGui.QColor]] = []
-        max_frame = None
-        if self.video_player.is_loaded():
-            frame_count = self.video_player.metadata.frame_count
-            if frame_count > 0:
-                max_frame = frame_count - 1
-        for frame, category in marker_map.items():
-            if max_frame is not None and (frame < 0 or frame > max_frame):
+        markers: List[TimelineMarker] = []
+        if not self.video_player.is_loaded() or not self.active_point:
+            self.detailed_timeline.set_markers(markers)
+            self.overview_timeline.set_markers(markers)
+            return
+
+        tracked_point = self.custom_tracker.point_definitions().get(self.active_point)
+        if not tracked_point:
+            self.detailed_timeline.set_markers(markers)
+            self.overview_timeline.set_markers(markers)
+            return
+
+        frame_count = self.video_player.metadata.frame_count
+        max_frame = frame_count - 1 if frame_count > 0 else None
+
+        def in_bounds(frame: int) -> bool:
+            if frame < 0:
+                return False
+            if max_frame is None:
+                return True
+            return frame <= max_frame
+
+        marker_records: Dict[int, Tuple[int, TimelineMarker]] = {}
+
+        def register_marker(frame: int, color: QtGui.QColor, category: str, priority: int) -> None:
+            if not in_bounds(frame):
+                return
+            normalized = TimelineMarker(int(frame), QtGui.QColor(color), category)
+            existing = marker_records.get(normalized.frame)
+            if existing and existing[0] > priority:
+                return
+            marker_records[normalized.frame] = (priority, normalized)
+
+        base_color = QtGui.QColor(*tracked_point.color)
+        base_color.setAlpha(235)
+        auto_color = QtGui.QColor(255, 170, 60)
+        auto_color.setAlpha(150)
+        interpolated_color = QtGui.QColor(90, 210, 140)
+        interpolated_color.setAlpha(130)
+        absence_color = QtGui.QColor(255, 80, 80)
+        absence_color.setAlpha(170)
+        provisional_color = QtGui.QColor(base_color)
+        provisional_color.setAlpha(190)
+
+        manual_frames = set(tracked_point.accepted_keyframe_frames())
+        for frame in manual_frames:
+            register_marker(frame, base_color, "manual", 80)
+
+        auto_frames = set(tracked_point.keyframe_frames()) - manual_frames
+        for frame in auto_frames:
+            register_marker(frame, auto_color, "auto", 60)
+
+        for anchor in self.custom_tracker.provisional_markers(self.active_point):
+            if anchor.frame in manual_frames:
                 continue
-            if visible_frames and frame not in visible_frames:
-                continue
-            if category == "stop":
-                color = QtGui.QColor("#ff5c5c")
-            elif category == "start":
-                color = QtGui.QColor("#64ffda")
-            else:
-                color = QtGui.QColor("#32ff8a")
-            markers.append((frame, color))
-        markers.sort(key=lambda item: item[0])
+            register_marker(anchor.frame, provisional_color, "provisional", 70)
+
+        interpolated_frames = set(tracked_point.interpolation_cache.keys())
+        interpolated_frames.difference_update(manual_frames)
+        interpolated_frames.difference_update(auto_frames)
+        for frame in interpolated_frames:
+            register_marker(frame, interpolated_color, "interpolated", 40)
+
+        for start, end in tracked_point.absent_ranges:
+            register_marker(start, absence_color, "stop", 100)
+            resume_frame = end + 1
+            register_marker(resume_frame, absence_color, "start", 100)
+
+        if tracked_point.open_absence_start is not None:
+            register_marker(tracked_point.open_absence_start, absence_color, "stop", 100)
+
+        markers = [entry[1] for entry in sorted(marker_records.values(), key=lambda item: item[1].frame)]
         self.detailed_timeline.set_markers(markers)
         self.overview_timeline.set_markers(markers)
 
@@ -1698,5 +2240,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self.playback_timer.stop()
         self._cancel_auto_track_task()
+        self._decoder_thread.quit()
+        self._decoder_thread.wait(1500)
         self.video_player.release()
         super().closeEvent(event)

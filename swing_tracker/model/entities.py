@@ -26,6 +26,7 @@ class TrackedPoint:
     color: ColorRGB
     positions: Dict[int, Point2D] = field(default_factory=dict)
     confidence: Dict[int, float] = field(default_factory=dict)
+    fb_errors: Dict[int, float] = field(default_factory=dict)
     low_confidence_frames: Set[int] = field(default_factory=set)
     keyframes: Dict[int, Point2D] = field(default_factory=dict)
     accepted_keyframes: Set[int] = field(default_factory=set)
@@ -35,7 +36,13 @@ class TrackedPoint:
     absent_ranges: List[Tuple[int, int]] = field(default_factory=list)
     open_absence_start: Optional[int] = None
 
-    def record(self, frame_index: int, position: Optional[Point2D], confidence: float) -> None:
+    def record(
+        self,
+        frame_index: int,
+        position: Optional[Point2D],
+        confidence: float,
+        fb_error: Optional[float] = None,
+    ) -> None:
         if position is not None:
             self.positions[frame_index] = position
             self.interpolation_cache[frame_index] = position
@@ -43,6 +50,10 @@ class TrackedPoint:
             self.positions.pop(frame_index, None)
             self.interpolation_cache.pop(frame_index, None)
         self.confidence[frame_index] = confidence
+        if fb_error is not None:
+            self.fb_errors[frame_index] = fb_error
+        else:
+            self.fb_errors.pop(frame_index, None)
         if confidence < 0.5:
             self.low_confidence_frames.add(frame_index)
         else:
@@ -57,6 +68,7 @@ class TrackedPoint:
         for idx in frames_to_remove:
             self.positions.pop(idx, None)
             self.confidence.pop(idx, None)
+            self.fb_errors.pop(idx, None)
             self.low_confidence_frames.discard(idx)
             self.interpolation_cache.pop(idx, None)
         keyframes_to_remove = [idx for idx in self.keyframes if idx > frame_index]
@@ -79,6 +91,7 @@ class TrackedPoint:
     def clear(self) -> None:
         self.positions.clear()
         self.confidence.clear()
+        self.fb_errors.clear()
         self.low_confidence_frames.clear()
         self.keyframes.clear()
         self.accepted_keyframes.clear()
@@ -90,7 +103,7 @@ class TrackedPoint:
 
     def set_keyframe(self, frame_index: int, position: Point2D, *, accepted: bool = False) -> None:
         self.keyframes[frame_index] = position
-        self.record(frame_index, position, 1.0)
+        self.record(frame_index, position, 1.0, fb_error=None)
         self.interpolation_cache.pop(frame_index, None)
         if accepted:
             self.accepted_keyframes.add(frame_index)

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import cv2
 import numpy as np
 
 from ..entities import Point2D, TrackIssue, TrackedPoint
 from ..settings import TrackingSettings
+from .provisional import AnchorMetrics, ProvisionalChain, build_provisional_chain
 
 
 @dataclass
@@ -37,6 +38,20 @@ class CustomPointTracker:
         self.prev_gray: Optional[np.ndarray] = None
         self.smoothing_enabled: bool = True
         self.truncate_future_on_manual_set: bool = True
+        self.interpolation_mode: str = "linear"
+        self.span_length: int = 50
+        self.threshold_confidence: float = 0.6
+        self.min_threshold_pixels: float = 6.0
+        self.threshold_scale: float = 0.04
+        self.nms_window: int = 8
+        self.min_segment_len: int = 6
+        self.max_provisionals_per_span: int = 5
+        self.min_improvement_px: float = 2.0
+        self.min_improvement_ratio: float = 0.2
+        self.smoothing_window: int = 5
+        self._provisional_cache: Dict[str, Dict[Tuple[int, int], ProvisionalChain]] = {}
+        self._provisional_rejections: Dict[str, Dict[Tuple[int, int], Set[int]]] = {}
+        self._provisional_dirty: Dict[str, Set[Tuple[int, int]]] = {}
 
     def configure_points(self, point_definitions: Dict[str, Tuple[int, int, int]]) -> None:
         self.points = {
@@ -45,12 +60,216 @@ class CustomPointTracker:
         }
         self.current_positions.clear()
         self.prev_gray = None
+        self._reset_provisional_state()
 
     def reset(self) -> None:
         for tracked_point in self.points.values():
             tracked_point.clear()
         self.current_positions.clear()
         self.prev_gray = None
+        self._reset_provisional_state()
+
+    # ------------------------------------------------------------------
+    # Provisional refinement helpers
+    # ------------------------------------------------------------------
+    def _reset_provisional_state(self) -> None:
+        self._provisional_cache = {}
+        self._provisional_rejections = {}
+        self._provisional_dirty = {}
+
+    def _invalidate_point_cache(self, point_name: Optional[str] = None) -> None:
+        if point_name is None:
+            self._provisional_cache.clear()
+            self._provisional_dirty.clear()
+            return
+        self._provisional_cache.pop(point_name, None)
+        self._provisional_dirty.pop(point_name, None)
+
+    def _rejections_for(self, point_name: str, span: Tuple[int, int]) -> Set[int]:
+        point_map = self._provisional_rejections.setdefault(point_name, {})
+        return point_map.setdefault(span, set())
+
+    def _mark_span_dirty(self, point_name: str, span: Tuple[int, int]) -> None:
+        self._provisional_dirty.setdefault(point_name, set()).add(span)
+
+    def _iter_span_pairs(self, tracked_point: TrackedPoint) -> Iterable[Tuple[int, int]]:
+        confirmed = tracked_point.accepted_keyframe_frames()
+        if len(confirmed) < 2:
+            confirmed = tracked_point.keyframe_frames()
+        confirmed = sorted(confirmed)
+        for idx in range(len(confirmed) - 1):
+            start = confirmed[idx]
+            end = confirmed[idx + 1]
+            if end <= start:
+                continue
+            if end - start > self.span_length:
+                continue
+            yield (start, end)
+
+    def _span_for_frame(self, tracked_point: TrackedPoint, frame_index: int) -> Optional[Tuple[int, int]]:
+        spans = list(self._iter_span_pairs(tracked_point))
+        if not spans:
+            return None
+        for start, end in spans:
+            if start <= frame_index <= end:
+                return (start, end)
+        # Fallback: closest span
+        if frame_index < spans[0][0]:
+            return spans[0]
+        return spans[-1]
+
+    def _compute_chain(self, point_name: str, span: Tuple[int, int]) -> Optional[ProvisionalChain]:
+        tracked_point = self.points.get(point_name)
+        if not tracked_point:
+            return None
+        start_frame, end_frame = span
+        if end_frame <= start_frame:
+            return None
+        start_pos = tracked_point.keyframes.get(start_frame)
+        end_pos = tracked_point.keyframes.get(end_frame)
+        if start_pos is None or end_pos is None:
+            return None
+        rejections = self._rejections_for(point_name, span)
+        chain = build_provisional_chain(
+            start_frame,
+            end_frame,
+            start_pos,
+            end_pos,
+            tracked_point.positions,
+            tracked_point.confidence,
+            tracked_point.fb_errors,
+            baseline_mode=self.interpolation_mode,
+            rejected_frames=rejections,
+            threshold_confidence=self.threshold_confidence,
+            min_threshold_pixels=self.min_threshold_pixels,
+            threshold_scale=self.threshold_scale,
+            nms_window=self.nms_window,
+            min_segment_len=self.min_segment_len,
+            max_provisionals=self.max_provisionals_per_span,
+            min_improvement_px=self.min_improvement_px,
+            min_improvement_ratio=self.min_improvement_ratio,
+            smoothing_window=self.smoothing_window,
+        )
+        if chain.total_provisionals() == 0:
+            # Ensure cache still records empty chain for UI consistency.
+            self._provisional_cache.setdefault(point_name, {})[span] = chain
+            self._provisional_dirty.setdefault(point_name, set()).discard(span)
+            return chain
+        self._provisional_cache.setdefault(point_name, {})[span] = chain
+        self._provisional_dirty.setdefault(point_name, set()).discard(span)
+        return chain
+
+    def _get_chain(self, point_name: str, span: Tuple[int, int]) -> Optional[ProvisionalChain]:
+        cache = self._provisional_cache.setdefault(point_name, {})
+        if span in cache and span not in self._provisional_dirty.get(point_name, set()):
+            return cache[span]
+        return self._compute_chain(point_name, span)
+
+    def ensure_all_spans(self, point_name: str) -> None:
+        tracked_point = self.points.get(point_name)
+        if not tracked_point:
+            return
+        for span in self._iter_span_pairs(tracked_point):
+            self._get_chain(point_name, span)
+
+    def provisional_chain_for_frame(
+        self, point_name: str, frame_index: int
+    ) -> Optional[ProvisionalChain]:
+        tracked_point = self.points.get(point_name)
+        if not tracked_point:
+            return None
+        span = self._span_for_frame(tracked_point, frame_index)
+        if span is None:
+            return None
+        return self._get_chain(point_name, span)
+
+    def provisional_chain_for_span(
+        self, point_name: str, span: Tuple[int, int]
+    ) -> Optional[ProvisionalChain]:
+        return self._get_chain(point_name, span)
+
+    def all_provisional_candidates(self, point_name: str) -> List[AnchorMetrics]:
+        self.ensure_all_spans(point_name)
+        cache = self._provisional_cache.get(point_name, {})
+        anchors: List[AnchorMetrics] = []
+        for chain in cache.values():
+            anchors.extend([c.anchor for c in chain.provisionals()])
+        anchors.sort(key=lambda anchor: anchor.frame)
+        return anchors
+
+    def provisional_markers(self, point_name: str) -> List[AnchorMetrics]:
+        return self.all_provisional_candidates(point_name)
+
+    def count_provisionals(self, point_name: str) -> int:
+        self.ensure_all_spans(point_name)
+        cache = self._provisional_cache.get(point_name, {})
+        return sum(chain.total_provisionals() for chain in cache.values())
+
+    def accept_provisional(self, point_name: str, span: Tuple[int, int], frame: int) -> bool:
+        tracked_point = self.points.get(point_name)
+        if not tracked_point:
+            return False
+        actual_span = span
+        inferred_span = self._span_for_frame(tracked_point, frame)
+        if inferred_span is not None:
+            actual_span = inferred_span
+        chain = self._get_chain(point_name, actual_span)
+        if not chain:
+            return False
+        candidate = next((c for c in chain.provisionals() if c.anchor.frame == frame), None)
+        if not candidate:
+            return False
+        tracked_point.set_keyframe(frame, candidate.anchor.position, accepted=True)
+        tracked_point.smoothed_position = candidate.anchor.position
+        tracked_point.last_frame_index = frame
+        self._mark_span_dirty(point_name, actual_span)
+        self._invalidate_point_cache(point_name)
+        rejections = self._rejections_for(point_name, actual_span)
+        rejections.discard(frame)
+        if not rejections:
+            point_rejections = self._provisional_rejections.get(point_name)
+            if point_rejections is not None:
+                point_rejections.pop(actual_span, None)
+        return True
+
+    def accept_all_provisionals(self, point_name: str, span: Tuple[int, int]) -> bool:
+        chain = self._get_chain(point_name, span)
+        if not chain:
+            return False
+        frames = [candidate.anchor.frame for candidate in chain.provisionals()]
+        changed = False
+        for frame in frames:
+            changed |= self.accept_provisional(point_name, span, frame)
+        return changed
+
+    def reject_provisional(self, point_name: str, span: Tuple[int, int], frame: int) -> bool:
+        tracked_point = self.points.get(point_name)
+        if not tracked_point:
+            return False
+        actual_span = span
+        inferred_span = self._span_for_frame(tracked_point, frame)
+        if inferred_span is not None:
+            actual_span = inferred_span
+        chain = self._get_chain(point_name, actual_span)
+        if not chain:
+            return False
+        candidate = next((c for c in chain.provisionals() if c.anchor.frame == frame), None)
+        if not candidate:
+            return False
+        self._rejections_for(point_name, actual_span).add(frame)
+        self._mark_span_dirty(point_name, actual_span)
+        self._invalidate_point_cache(point_name)
+        return True
+
+    def reject_all_provisionals(self, point_name: str, span: Tuple[int, int]) -> bool:
+        chain = self._get_chain(point_name, span)
+        if not chain:
+            return False
+        frames = [candidate.anchor.frame for candidate in chain.provisionals()]
+        changed = False
+        for frame in frames:
+            changed |= self.reject_provisional(point_name, span, frame)
+        return changed
 
     def process_frame(self, frame_bgr: np.ndarray, frame_index: int, record: bool) -> CustomPointFrameResult:
         height, width = frame_bgr.shape[:2]
@@ -61,6 +280,7 @@ class CustomPointTracker:
         new_positions: Dict[str, Point2D] = {}
 
         flow_results: Dict[str, Optional[Point2D]] = {}
+        flow_fb_errors: Dict[str, Optional[float]] = {}
         if record and self.prev_gray is not None and self.current_positions:
             prev_items = list(self.current_positions.items())
             prev_points = np.array([pos for _, pos in prev_items], dtype=np.float32).reshape(-1, 1, 2)
@@ -71,14 +291,36 @@ class CustomPointTracker:
                 None,
                 **self.lk_params,
             )
+            back_points = None
+            back_status = None
+            if next_points is not None:
+                back_points, back_status, _ = cv2.calcOpticalFlowPyrLK(
+                    gray,
+                    self.prev_gray,
+                    next_points,
+                    None,
+                    **self.lk_params,
+                )
 
             for idx, (point_name, prev_pos) in enumerate(prev_items):
+                fb_error_value: Optional[float] = None
                 if status[idx] == 1:
                     x, y = next_points[idx][0]
                     if 0 <= x < width and 0 <= y < height:
                         flow_results[point_name] = (float(x), float(y))
+                        if (
+                            back_points is not None
+                            and back_status is not None
+                            and back_status[idx] == 1
+                        ):
+                            back_pos = back_points[idx][0]
+                            diff_x = float(prev_points[idx][0][0] - back_pos[0])
+                            diff_y = float(prev_points[idx][0][1] - back_pos[1])
+                            fb_error_value = float(np.hypot(diff_x, diff_y))
+                        flow_fb_errors[point_name] = fb_error_value
                         continue
                 flow_results[point_name] = None
+                flow_fb_errors[point_name] = None
 
         for point_name, tracked_point in self.points.items():
             if not tracked_point.keyframes:
@@ -86,6 +328,7 @@ class CustomPointTracker:
             if tracked_point.is_absent(frame_index):
                 tracked_point.positions.pop(frame_index, None)
                 tracked_point.confidence.pop(frame_index, None)
+                tracked_point.fb_errors.pop(frame_index, None)
                 tracked_point.low_confidence_frames.discard(frame_index)
                 tracked_point.interpolation_cache.pop(frame_index, None)
                 tracked_point.smoothed_position = None
@@ -97,7 +340,12 @@ class CustomPointTracker:
 
             if smoothed is not None:
                 if record:
-                    tracked_point.record(frame_index, smoothed, 1.0)
+                    tracked_point.record(
+                        frame_index,
+                        smoothed,
+                        1.0,
+                        fb_error=flow_fb_errors.get(point_name),
+                    )
                     self._trim_history(tracked_point, frame_index)
                 new_positions[point_name] = smoothed
                 tracked_point.smoothed_position = smoothed
@@ -134,6 +382,9 @@ class CustomPointTracker:
         self.current_positions = new_positions
         self.prev_gray = gray
 
+        if record:
+            self._invalidate_point_cache()
+
         return CustomPointFrameResult(
             positions=new_positions,
             issues=issues,
@@ -155,6 +406,7 @@ class CustomPointTracker:
         tracked_point.last_frame_index = frame_index
         self.current_positions[point_name] = position
         self.prev_gray = None
+        self._invalidate_point_cache(point_name)
 
     def clear_point_history(self, point_name: str) -> None:
         if point_name not in self.points:
@@ -162,6 +414,7 @@ class CustomPointTracker:
         self.points[point_name].clear()
         self.current_positions.pop(point_name, None)
         self.prev_gray = None
+        self._invalidate_point_cache(point_name)
 
     def mark_point_absent(self, point_name: str, start_frame: int, end_frame: int) -> None:
         tracked_point = self.points.get(point_name)
@@ -171,6 +424,7 @@ class CustomPointTracker:
         end = max(start, max(start_frame, end_frame))
         tracked_point.add_absence(start, end)
         self._apply_absence_range(tracked_point, start, end)
+        self._invalidate_point_cache(point_name)
 
     def set_point_absences(self, point_name: str, ranges: List[Tuple[int, int]]) -> None:
         tracked_point = self.points.get(point_name)
@@ -184,6 +438,7 @@ class CustomPointTracker:
             tracked_point.add_absence(start, end)
         for start, end in tracked_point.absent_ranges:
             self._apply_absence_range(tracked_point, start, end)
+        self._invalidate_point_cache(point_name)
 
     def clear_point_absences(self, point_name: str) -> None:
         tracked_point = self.points.get(point_name)
@@ -191,6 +446,7 @@ class CustomPointTracker:
             return
         tracked_point.clear_absence_ranges()
         self.current_positions.pop(point_name, None)
+        self._invalidate_point_cache(point_name)
 
     def point_absence_ranges(self, point_name: str) -> List[Tuple[int, int]]:
         tracked_point = self.points.get(point_name)
@@ -213,6 +469,7 @@ class CustomPointTracker:
             tracked_point.truncate_after(frame_index - 1)
             self.current_positions.pop(point_name, None)
             self.prev_gray = None
+            self._invalidate_point_cache(point_name)
             return True
 
         if frame_index <= current_start:
@@ -227,6 +484,7 @@ class CustomPointTracker:
         tracked_point.end_absence_at(frame_index)
         self.current_positions.pop(point_name, None)
         self.prev_gray = None
+        self._invalidate_point_cache(point_name)
         return True
 
     def timeline_markers(self) -> Dict[int, str]:
@@ -279,7 +537,9 @@ class CustomPointTracker:
         changed = tracked_point.mark_keyframe_accepted(frame_index)
         if changed:
             tracked_point.interpolation_cache.pop(frame_index, None)
+            self._invalidate_point_cache(point_name)
         return changed
+
 
     def reject_keyframe(self, point_name: str, frame_index: int) -> bool:
         tracked_point = self.points.get(point_name)
@@ -288,7 +548,9 @@ class CustomPointTracker:
         removed = tracked_point.remove_keyframe(frame_index)
         if removed:
             tracked_point.interpolation_cache.pop(frame_index, None)
+            self._invalidate_point_cache(point_name)
         return removed
+        
 
     def update_from_settings(self, settings: TrackingSettings) -> None:
         self.smoothing_alpha = settings.smoothing_alpha
@@ -296,6 +558,10 @@ class CustomPointTracker:
         self.deviation_threshold = settings.deviation_threshold
         self.max_history_frames = settings.history_frames
         self.truncate_future_on_manual_set = settings.truncate_future_on_manual_set
+        self.interpolation_mode = settings.baseline_mode.lower()
+        if self.interpolation_mode not in {"linear", "cubic", "const-velocity"}:
+            self.interpolation_mode = "linear"
+        self.threshold_confidence = float(max(0.0, min(1.0, settings.issue_confidence_threshold)))
         win_size = int(max(5, settings.optical_flow_window_size))
         if win_size % 2 == 0:
             win_size += 1
@@ -306,6 +572,7 @@ class CustomPointTracker:
             30,
             float(max(0.001, settings.optical_flow_termination)),
         )
+        self._invalidate_point_cache()
 
     def add_auto_keyframe(self, point_name: str, frame_index: int) -> None:
         if point_name not in self.points:
@@ -316,6 +583,7 @@ class CustomPointTracker:
             return
         tracked_point.set_keyframe(frame_index, position, accepted=False)
         self._interpolate_neighbors(tracked_point, frame_index)
+        self._invalidate_point_cache(point_name)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -435,6 +703,7 @@ class CustomPointTracker:
         for frame in frames_to_remove:
             tracked_point.positions.pop(frame, None)
             tracked_point.confidence.pop(frame, None)
+            tracked_point.fb_errors.pop(frame, None)
             tracked_point.low_confidence_frames.discard(frame)
             tracked_point.interpolation_cache.pop(frame, None)
 
@@ -465,6 +734,7 @@ class CustomPointTracker:
         for f in to_remove:
             tracked_point.positions.pop(f, None)
             tracked_point.confidence.pop(f, None)
+            tracked_point.fb_errors.pop(f, None)
             tracked_point.low_confidence_frames.discard(f)
             tracked_point.interpolation_cache.pop(f, None)
 

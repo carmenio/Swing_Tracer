@@ -31,6 +31,7 @@ class TrackingSettings:
     issue_confidence_threshold: float = 0.6
     resolved_confidence_threshold: float = 0.8
     truncate_future_on_manual_set: bool = True
+    baseline_mode: str = "linear"
 
 
 @dataclass
