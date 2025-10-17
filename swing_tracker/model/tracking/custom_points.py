@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import cv2
 import numpy as np
 
-from ..models import Point2D, TrackIssue, TrackedPoint
+from ..entities import Point2D, TrackIssue, TrackedPoint
 from ..settings import TrackingSettings
 
 

@@ -1,6 +1,6 @@
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from .models import TrackIssue
+from .entities import TrackIssue
 
 
 class IssueLog:

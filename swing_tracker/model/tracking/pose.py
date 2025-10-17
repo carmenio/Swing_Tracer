@@ -5,7 +5,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-from ..models import LandmarkData, TrackIssue
+from ..entities import LandmarkData, TrackIssue
 
 
 @dataclass
