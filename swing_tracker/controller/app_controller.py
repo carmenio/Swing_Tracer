@@ -44,6 +44,10 @@ class SwingTrackerController:
     def custom_tracker(self):  # type: ignore[override]
         return self._model.custom_tracker
 
+    @property
+    def tracking_manager(self):
+        return self._model.tracking_manager
+
     def set_tracking_video_path(self, path: Optional[Path]) -> None:
         self._model.set_tracking_video_path(path)
 

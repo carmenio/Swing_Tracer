@@ -2,5 +2,6 @@
 
 from .pose import PoseTracker
 from .custom_points import CustomPointTracker
+from .manager import TrackingManager
 
-__all__ = ["PoseTracker", "CustomPointTracker"]
+__all__ = ["PoseTracker", "CustomPointTracker", "TrackingManager"]

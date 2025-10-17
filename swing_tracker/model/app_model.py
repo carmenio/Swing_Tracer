@@ -7,7 +7,7 @@ import cv2
 import threading
 
 from .settings import AppSettings, SettingsManager, get_settings_path
-from .tracking import CustomPointTracker
+from .tracking import CustomPointTracker, TrackingManager
 from .video import VideoPlayer
 
 
@@ -30,6 +30,7 @@ class SwingTrackerModel:
         self.custom_tracker = CustomPointTracker()
         self.custom_tracker.update_from_settings(self.settings.tracking)
         self.custom_tracker.set_frame_loader(self._fetch_tracking_frame)
+        self.tracking_manager = TrackingManager(self.custom_tracker)
 
         self.current_frame_bgr: Optional[cv2.typing.MatLike] = None
 

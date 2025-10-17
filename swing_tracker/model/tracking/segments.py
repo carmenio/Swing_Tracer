@@ -6,7 +6,7 @@ from __future__ import annotations
 # that reflect deviations in tracking accuracy.
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import math
 
@@ -230,6 +230,7 @@ class SegmentBuilder:
         frames: Dict[int, "FrameSample"],
         accepted_frames: Set[int],
         rejected_frames: Optional[Set[int]] = None,
+        progress_callback: Optional[Callable[[float], None]] = None,
     ) -> Optional[SegmentBuildResult]:
         """
         Build tracking segments between a start and end frame using optical flow data.
@@ -250,19 +251,19 @@ class SegmentBuilder:
             Optional[SegmentBuildResult]: The resultant tracking segments and related data,
             or None if tracking fails.
         """
-        
-        print(start_pos, end_pos)
         if span_end <= span_start:
             return None
-
-        print('start')
         
         if any(frame not in frames for frame in range(span_start, span_end + 1)):
             return None
-        
-        print('passsing')
 
-        optical_flow = self._track_with_lk(span_start, span_end, start_pos, frames)
+        optical_flow = self._track_with_lk(
+            span_start,
+            span_end,
+            start_pos,
+            frames,
+            progress_callback=progress_callback,
+        )
         # if span_end not in optical_flow.positions:
         #     # Try using CSRT tracking if Lucas-Kanade fails.
         #     csrt_flow = self._track_with_csrt(span_start, span_end, start_pos, frames)
@@ -297,7 +298,6 @@ class SegmentBuilder:
             smoothing_window=self.smoothing_window,
         )
 
-        print(chain)
         # Convert the chain into tracking segments.
         segments = self._segments_from_chain(chain, optical_flow.positions, accepted_frames)
 
@@ -315,6 +315,8 @@ class SegmentBuilder:
         span_end: int,
         start_pos: Point2D,
         frames: Dict[int, "FrameSample"],
+        *,
+        progress_callback: Optional[Callable[[float], None]] = None,
     ) -> OpticalFlowResult:
         """
         Perform Lucas-Kanade optical flow tracking between frames.
@@ -340,6 +342,10 @@ class SegmentBuilder:
 
         lk_params = dict(winSize=(21, 21), maxLevel=3, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
 
+        total_frames = max(1, span_end - span_start)
+        if progress_callback is not None:
+            progress_callback(0.0)
+
         for frame_index in range(span_start + 1, span_end + 1):
             current_sample = frames.get(frame_index)
             if current_sample is None:
@@ -361,6 +367,13 @@ class SegmentBuilder:
 
             prev_frame = current_frame
             prev_point = next_pt
+
+            if progress_callback is not None:
+                progress = (frame_index - span_start) / total_frames
+                progress_callback(min(1.0, max(0.0, progress)))
+
+        if progress_callback is not None:
+            progress_callback(1.0)
 
         return OpticalFlowResult(positions=positions, confidences=confidences, fb_errors=fb_errors)
 

@@ -286,6 +286,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.controller = controller
         self.controller.set_view(self)
+        self.tracking_manager = self.controller.tracking_manager
 
         self.setWindowTitle("Swing Tracker")
         self.resize(1440, 840)
@@ -315,9 +316,13 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._issue_items: List[Dict[str, Any]] = []
         self._active_issue_frame: Optional[int] = None
 
+        self._tracking_hide_timer = QtCore.QTimer(self)
+        self._tracking_hide_timer.setSingleShot(True)
+
         self._apply_settings_to_ui()
         self._refresh_issue_panel()
         self._refresh_point_statuses()
+        self._connect_tracking_manager()
 
     # ------------------------------------------------------------------
     # Model-backed properties
@@ -638,6 +643,39 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         header_layout.addWidget(self.issue_toggle_button)
         layout.addLayout(header_layout)
 
+        self.tracker_progress_widget = QtWidgets.QWidget()
+        tracker_layout = QtWidgets.QVBoxLayout(self.tracker_progress_widget)
+        tracker_layout.setContentsMargins(0, 4, 0, 12)
+        tracker_layout.setSpacing(4)
+
+        self.tracker_progress_bar = QtWidgets.QProgressBar()
+        self.tracker_progress_bar.setRange(0, 100)
+        self.tracker_progress_bar.setValue(0)
+        self.tracker_progress_bar.setTextVisible(False)
+        self.tracker_progress_bar.setFixedHeight(6)
+        self.tracker_progress_bar.setStyleSheet(
+            """
+            QProgressBar {
+                background-color: #1a1a1a;
+                border: 1px solid #252525;
+                border-radius: 4px;
+            }
+            QProgressBar::chunk {
+                background-color: #3fb984;
+                border-radius: 4px;
+            }
+            """
+        )
+        tracker_layout.addWidget(self.tracker_progress_bar)
+
+        self.tracker_progress_label = QtWidgets.QLabel("Tracking Complete")
+        self.tracker_progress_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        self.tracker_progress_label.setStyleSheet("color: #9c9c9c; font-size: 11px;")
+        tracker_layout.addWidget(self.tracker_progress_label)
+        self.tracker_progress_label.hide()
+        self.tracker_progress_widget.setVisible(False)
+        layout.addWidget(self.tracker_progress_widget)
+
         self.issue_scroll = QtWidgets.QScrollArea()
         self.issue_scroll.setWidgetResizable(True)
         self.issue_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
@@ -819,6 +857,15 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self.issue_toggle_button.clicked.connect(self._toggle_issue_collapse)
         self.settings_button.clicked.connect(self._open_settings_dialog)
 
+    def _connect_tracking_manager(self) -> None:
+        self._tracking_hide_timer.timeout.connect(self._hide_tracking_feedback)
+        manager = self.tracking_manager
+        manager.tracking_started.connect(self._on_tracking_started)
+        manager.overall_progress.connect(self._on_tracking_progress)
+        manager.tracking_finished.connect(self._on_tracking_finished)
+        manager.segment_ready.connect(self._on_tracking_segment_ready)
+        manager.segment_failed.connect(self._on_tracking_segment_failed)
+
     def _format_speed_text(self, speed: float) -> str:
         return f"{speed:g}x"
 
@@ -880,6 +927,50 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             QtCore.Q_ARG(int, frames),
         )
 
+    @QtCore.pyqtSlot()
+    def _on_tracking_started(self) -> None:
+        self.tracker_progress_label.hide()
+        self.tracker_progress_bar.setValue(0)
+        self.tracker_progress_widget.setVisible(True)
+        self._tracking_hide_timer.stop()
+
+    @QtCore.pyqtSlot(float)
+    def _on_tracking_progress(self, value: float) -> None:
+        scaled = int(max(0.0, min(1.0, value)) * 100)
+        self.tracker_progress_bar.setValue(scaled)
+        if not self.tracker_progress_widget.isVisible():
+            self.tracker_progress_widget.setVisible(True)
+
+    @QtCore.pyqtSlot()
+    def _on_tracking_finished(self) -> None:
+        if not self.tracker_progress_widget.isVisible():
+            return
+        self.tracker_progress_bar.setValue(100)
+        self.tracker_progress_label.setText("Tracking Complete")
+        self.tracker_progress_label.show()
+        self._tracking_hide_timer.start(1200)
+
+    @QtCore.pyqtSlot()
+    def _hide_tracking_feedback(self) -> None:
+        self.tracker_progress_widget.setVisible(False)
+        self.tracker_progress_label.hide()
+
+    @QtCore.pyqtSlot(str, tuple)
+    def _on_tracking_segment_ready(self, point_name: str, span: Tuple[int, int]) -> None:
+        if point_name == self.active_point:
+            self._update_timeline_markers()
+            self._refresh_issue_panel()
+            if self.current_frame_bgr is not None:
+                self._render_current_frame()
+
+    @QtCore.pyqtSlot(str, tuple, str)
+    def _on_tracking_segment_failed(self, point_name: str, span: Tuple[int, int], message: str) -> None:
+        QtCore.qWarning(f"Tracking failed for {point_name} span {span}: {message}")
+        if self.tracker_progress_widget.isVisible():
+            self.tracker_progress_label.setText("Tracking Error")
+            self.tracker_progress_label.show()
+            self._tracking_hide_timer.start(2000)
+
     # ------------------------------------------------------------------
     # Video workflow
     # ------------------------------------------------------------------
@@ -895,6 +986,8 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         if self.playback_timer.isActive():
             self.playback_timer.stop()
         self._update_play_button(False)
+        self.tracking_manager.reset()
+        self._hide_tracking_feedback()
 
         try:
             self.controller.set_tracking_video_path(None)
@@ -974,6 +1067,8 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._reset_playback_clock()
         self.video_player.reset()
         self.custom_tracker.reset()
+        self.tracking_manager.reset()
+        self._hide_tracking_feedback()
         self.current_frame_bgr = None
         self._refresh_issue_panel()
         self.current_time_label.setText("0:00")
@@ -1553,24 +1648,28 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
 
     def _accept_provisional_candidate(self, point_name: str, span: Tuple[int, int], frame_index: int) -> None:
         if self.custom_tracker.accept_provisional(point_name, span, frame_index):
+            self.tracking_manager.request_point(point_name)
             self._update_timeline_markers()
             self._refresh_issue_panel()
             self._advance_to_next_issue(frame_index)
 
     def _reject_provisional_candidate(self, point_name: str, span: Tuple[int, int], frame_index: int) -> None:
         if self.custom_tracker.reject_provisional(point_name, span, frame_index):
+            self.tracking_manager.request_point(point_name)
             self._update_timeline_markers()
             self._refresh_issue_panel()
             self._advance_to_next_issue(frame_index, pause_when_empty=True)
 
     def _accept_all_provisionals(self, point_name: str, span: Tuple[int, int]) -> None:
         if self.custom_tracker.accept_all_provisionals(point_name, span):
+            self.tracking_manager.request_point(point_name)
             self._update_timeline_markers()
             self._refresh_issue_panel()
             self._advance_to_next_issue(span[1])
 
     def _reject_all_provisionals(self, point_name: str, span: Tuple[int, int]) -> None:
         if self.custom_tracker.reject_all_provisionals(point_name, span):
+            self.tracking_manager.request_point(point_name)
             self._update_timeline_markers()
             self._refresh_issue_panel()
             self._advance_to_next_issue(span[1], pause_when_empty=True)
@@ -1654,6 +1753,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             return
 
         self.custom_tracker.set_manual_point(self.video_player.current_frame_index, point, (x, y))
+        self.tracking_manager.request_point(point)
         self._refresh_issue_panel()
         self._refresh_point_statuses()
         self._update_timeline_markers()
@@ -1846,6 +1946,8 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             self.overview_timeline.set_segments([])
             return
 
+        self.tracking_manager.request_point(self.active_point)
+
         frame_count = self.video_player.metadata.frame_count
         max_frame = frame_count - 1 if frame_count > 0 else None
 
@@ -1944,6 +2046,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self.playback_timer.stop()
         self._decoder_thread.quit()
         self._decoder_thread.wait(1500)
+        self.tracking_manager.shutdown()
         self.controller.set_tracking_video_path(None)
         self.video_player.release()
         super().closeEvent(event)

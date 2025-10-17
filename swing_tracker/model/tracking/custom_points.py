@@ -8,8 +8,8 @@ import cv2
 
 from ..entities import Point2D, TrackIssue, TrackedPoint
 from ..settings import TrackingSettings
-from .provisional import AnchorMetrics, ProvisionalChain, build_provisional_chain
-from .segments import FrameSample, SegmentBuildResult, SegmentBuilder, TrackingSegment
+from .provisional import AnchorMetrics, ProvisionalChain
+from .segments import FrameSample, SegmentBuildResult, TrackingSegment
 
 
 def _rgb_to_hex(rgb: Tuple[int, int, int]) -> str:
@@ -88,11 +88,14 @@ class CustomPointTracker:
             self._provisional_dirty.clear()
             self._segment_results.clear()
             self._segment_dirty.clear()
+            for name in self.points:
+                self._mark_all_spans_dirty(name)
             return
         self._provisional_cache.pop(point_name, None)
         self._provisional_dirty.pop(point_name, None)
         self._segment_results.pop(point_name, None)
         self._segment_dirty.pop(point_name, None)
+        self._mark_all_spans_dirty(point_name)
 
     def _invalidate_segment_cache(self, point_name: Optional[str] = None) -> None:
         if point_name is None:
@@ -109,81 +112,37 @@ class CustomPointTracker:
     def _mark_span_dirty(self, point_name: str, span: Tuple[int, int]) -> None:
         self._provisional_dirty.setdefault(point_name, set()).add(span)
         self._segment_dirty.setdefault(point_name, set()).add(span)
+        result_map = self._segment_results.get(point_name)
+        if result_map is not None:
+            result_map.pop(span, None)
+        cache = self._provisional_cache.get(point_name)
+        if cache is not None:
+            cache.pop(span, None)
+
+    def _mark_all_spans_dirty(self, point_name: str) -> None:
+        tracked_point = self.points.get(point_name)
+        if not tracked_point:
+            return
+        spans = list(self._iter_span_pairs(tracked_point))
+        if not spans:
+            return
+        segment_dirty = self._segment_dirty.setdefault(point_name, set())
+        provisional_dirty = self._provisional_dirty.setdefault(point_name, set())
+        cache = self._provisional_cache.setdefault(point_name, {})
+        results = self._segment_results.setdefault(point_name, {})
+        for span in spans:
+            segment_dirty.add(span)
+            provisional_dirty.add(span)
+            cache.pop(span, None)
+            results.pop(span, None)
 
     def _segment_result(
         self, point_name: str, span: Tuple[int, int], tracked_point: TrackedPoint
     ) -> Optional[SegmentBuildResult]:
-        result_map = self._segment_results.setdefault(point_name, {})
-        dirty_spans = self._segment_dirty.setdefault(point_name, set())
-        if span in result_map and span not in dirty_spans:
-            return result_map[span]
-
-        result = self._build_segment_result(point_name, span, tracked_point)
-        if result is not None:
-            result_map[span] = result
-            dirty_spans.discard(span)
-        else:
-            result_map.pop(span, None)
-        return result
-
-    def _build_segment_result(
-        self, point_name: str, span: Tuple[int, int], tracked_point: TrackedPoint
-    ) -> Optional[SegmentBuildResult]:
-        start_frame, end_frame = span
-        if end_frame <= start_frame:
+        if span in self._segment_dirty.get(point_name, set()):
             return None
-        start_pos = tracked_point.keyframes.get(start_frame)
-        end_pos = tracked_point.keyframes.get(end_frame)
-        if start_pos is None or end_pos is None:
-            return None
-
-        frames_needed = range(start_frame, end_frame + 1)
-        frame_samples: Dict[int, FrameSample] = {}
-        for frame_index in frames_needed:
-            sample = self._frame_samples.get(frame_index)
-            if sample is None and self._frame_loader is not None:
-                frame_bgr = self._frame_loader(frame_index)
-                if frame_bgr is not None:
-                    self._store_frame(frame_index, frame_bgr)
-                    sample = self._frame_samples.get(frame_index)
-            if sample is None:
-                return None
-            frame_samples[frame_index] = sample
-
-        builder = SegmentBuilder(
-            baseline_mode=self.interpolation_mode,
-            threshold_confidence=self.threshold_confidence,
-            min_threshold_pixels=self.min_threshold_pixels,
-            threshold_scale=self.threshold_scale,
-            nms_window=self.nms_window,
-            min_segment_len=self.min_segment_len,
-            max_provisionals=self.max_provisionals_per_span,
-            min_improvement_px=self.min_improvement_px,
-            min_improvement_ratio=self.min_improvement_ratio,
-            smoothing_window=self.smoothing_window,
-            entity_colour=_rgb_to_hex(tracked_point.color),
-        )
-
-        result = builder.build(
-            span_start=start_frame,
-            span_end=end_frame,
-            start_pos=start_pos,
-            end_pos=end_pos,
-            frames=frame_samples,
-            accepted_frames=set(tracked_point.accepted_keyframe_frames()),
-            rejected_frames=self._rejections_for(point_name, span).copy(),
-        )
-        if result is None:
-            return None
-
-        for frame_index, position in result.optical_flow.positions.items():
-            if frame_index in tracked_point.keyframes:
-                continue
-            tracked_point.positions[frame_index] = position
-            tracked_point.confidence[frame_index] = result.optical_flow.confidences.get(frame_index, 0.0)
-            tracked_point.fb_errors[frame_index] = result.optical_flow.fb_errors.get(frame_index, 0.0)
-
-        return result
+        result_map = self._segment_results.get(point_name, {})
+        return result_map.get(span)
 
     def _iter_span_pairs(self, tracked_point: TrackedPoint) -> Iterable[Tuple[int, int]]:
         confirmed = tracked_point.accepted_keyframe_frames()
@@ -194,8 +153,6 @@ class CustomPointTracker:
             start = confirmed[idx]
             end = confirmed[idx + 1]
             if end <= start:
-                continue
-            if end - start > self.span_length:
                 continue
             yield (start, end)
 
@@ -211,56 +168,17 @@ class CustomPointTracker:
             return spans[0]
         return spans[-1]
 
-    def _compute_chain(self, point_name: str, span: Tuple[int, int]) -> Optional[ProvisionalChain]:
-        tracked_point = self.points.get(point_name)
-        if not tracked_point:
-            return None
-        start_frame, end_frame = span
-        if end_frame <= start_frame:
-            return None
-        start_pos = tracked_point.keyframes.get(start_frame)
-        end_pos = tracked_point.keyframes.get(end_frame)
-        if start_pos is None or end_pos is None:
-            return None
-        rejections = self._rejections_for(point_name, span)
-        segment_result = self._segment_result(point_name, span, tracked_point)
-        if segment_result is not None:
-            chain = segment_result.chain
-        else:
-            chain = build_provisional_chain(
-                start_frame,
-                end_frame,
-                start_pos,
-                end_pos,
-                tracked_point.positions,
-                tracked_point.confidence,
-                tracked_point.fb_errors,
-                baseline_mode=self.interpolation_mode,
-                rejected_frames=rejections,
-                threshold_confidence=self.threshold_confidence,
-                min_threshold_pixels=self.min_threshold_pixels,
-                threshold_scale=self.threshold_scale,
-                nms_window=self.nms_window,
-                min_segment_len=self.min_segment_len,
-                max_provisionals=self.max_provisionals_per_span,
-                min_improvement_px=self.min_improvement_px,
-                min_improvement_ratio=self.min_improvement_ratio,
-                smoothing_window=self.smoothing_window,
-            )
-        if chain.total_provisionals() == 0:
-            # Ensure cache still records empty chain for UI consistency.
-            self._provisional_cache.setdefault(point_name, {})[span] = chain
-            self._provisional_dirty.setdefault(point_name, set()).discard(span)
-            return chain
-        self._provisional_cache.setdefault(point_name, {})[span] = chain
-        self._provisional_dirty.setdefault(point_name, set()).discard(span)
-        return chain
-
     def _get_chain(self, point_name: str, span: Tuple[int, int]) -> Optional[ProvisionalChain]:
         cache = self._provisional_cache.setdefault(point_name, {})
-        if span in cache and span not in self._provisional_dirty.get(point_name, set()):
+        dirty_spans = self._provisional_dirty.setdefault(point_name, set())
+        if span in cache and span not in dirty_spans:
             return cache[span]
-        return self._compute_chain(point_name, span)
+        result_map = self._segment_results.get(point_name, {})
+        result = result_map.get(span)
+        if result is None or span in dirty_spans:
+            return None
+        cache[span] = result.chain
+        return result.chain
 
     def ensure_all_spans(self, point_name: str) -> None:
         tracked_point = self.points.get(point_name)
@@ -313,6 +231,62 @@ class CustomPointTracker:
                 segments.extend(result.segments)
         segments.sort(key=lambda segment: (segment.start_key.frame, segment.end_key.frame))
         return segments
+
+    def span_pairs(self, point_name: str) -> List[Tuple[int, int]]:
+        tracked_point = self.points.get(point_name)
+        if not tracked_point:
+            return []
+        return list(self._iter_span_pairs(tracked_point))
+
+    def requires_tracking(self, point_name: str, span: Tuple[int, int]) -> bool:
+        dirty_spans = self._segment_dirty.get(point_name, set())
+        if span in dirty_spans:
+            return True
+        result_map = self._segment_results.get(point_name, {})
+        return span not in result_map
+
+    def get_frame_loader(self):
+        return self._frame_loader
+
+    def point_colour_hex(self, point_name: str) -> Optional[str]:
+        tracked_point = self.points.get(point_name)
+        if not tracked_point:
+            return None
+        return _rgb_to_hex(tracked_point.color)
+
+    def rejected_frames_for_span(self, point_name: str, span: Tuple[int, int]) -> Set[int]:
+        return self._rejections_for(point_name, span).copy()
+
+    def apply_segment_result(
+        self,
+        point_name: str,
+        span: Tuple[int, int],
+        result: Optional[SegmentBuildResult],
+    ) -> None:
+        tracked_point = self.points.get(point_name)
+        if not tracked_point:
+            return
+
+        if result is None:
+            # Leave the span dirty so the manager can retry later.
+            self._mark_span_dirty(point_name, span)
+            return
+
+        for frame_index, position in result.optical_flow.positions.items():
+            if frame_index in tracked_point.keyframes:
+                continue
+            tracked_point.positions[frame_index] = position
+            tracked_point.confidence[frame_index] = result.optical_flow.confidences.get(frame_index, 0.0)
+            tracked_point.fb_errors[frame_index] = result.optical_flow.fb_errors.get(frame_index, 0.0)
+
+        cache = self._provisional_cache.setdefault(point_name, {})
+        cache[span] = result.chain
+        self._provisional_dirty.setdefault(point_name, set()).discard(span)
+
+        result_map = self._segment_results.setdefault(point_name, {})
+        result_map[span] = result
+        self._segment_dirty.setdefault(point_name, set()).discard(span)
+
 
     def accept_provisional(self, point_name: str, span: Tuple[int, int], frame: int) -> bool:
         tracked_point = self.points.get(point_name)
