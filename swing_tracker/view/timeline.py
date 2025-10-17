@@ -288,12 +288,12 @@ class DetailedTimeline(QtWidgets.QWidget):
         end_point: QtCore.QPointF,
     ) -> None:
         print("run")
-        if segment.accepted and segment.entity_colour:
-            color = QtGui.QColor(segment.entity_colour)
-            pen = QtGui.QPen(color, 3, cap=QtCore.Qt.RoundCap)
-            painter.setPen(pen)
-            painter.drawLine(start_point, end_point)
-            return
+        # if segment.accepted and segment.entity_colour:
+        #     color = QtGui.QColor(segment.entity_colour)
+        #     pen = QtGui.QPen(color, 3, cap=QtCore.Qt.RoundCap)
+        #     painter.setPen(pen)
+        #     painter.drawLine(start_point, end_point)
+        #     return
 
         color_stops = segment.color_stops()
         print("DEBUG: _draw_segment_line: segment frames", segment.start_key.frame, segment.end_key.frame, "color_stops:", color_stops)

@@ -263,13 +263,13 @@ class SegmentBuilder:
         print('passsing')
 
         optical_flow = self._track_with_lk(span_start, span_end, start_pos, frames)
-        if span_end not in optical_flow.positions:
-            # Try using CSRT tracking if Lucas-Kanade fails.
-            csrt_flow = self._track_with_csrt(span_start, span_end, start_pos, frames)
-            for frame, pos in csrt_flow.positions.items():
-                optical_flow.positions.setdefault(frame, pos)
-                optical_flow.confidences.setdefault(frame, csrt_flow.confidences.get(frame, 0.0))
-                optical_flow.fb_errors.setdefault(frame, csrt_flow.fb_errors.get(frame, 0.0))
+        # if span_end not in optical_flow.positions:
+        #     # Try using CSRT tracking if Lucas-Kanade fails.
+        #     csrt_flow = self._track_with_csrt(span_start, span_end, start_pos, frames)
+        #     for frame, pos in csrt_flow.positions.items():
+        #         optical_flow.positions.setdefault(frame, pos)
+        #         optical_flow.confidences.setdefault(frame, csrt_flow.confidences.get(frame, 0.0))
+        #         optical_flow.fb_errors.setdefault(frame, csrt_flow.fb_errors.get(frame, 0.0))
 
         if span_end not in optical_flow.positions:
             # Unable to build a complete tracking.
