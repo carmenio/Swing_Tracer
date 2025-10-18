@@ -861,7 +861,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self.toggle_occluded_button.setCursor(QtCore.Qt.PointingHandCursor)
         self.toggle_occluded_button.setStyleSheet("")
         self.toggle_occluded_button.setEnabled(False)
-        self.toggle_occluded_button.clicked.connect(self._toggle_point_occluded)
+        self.toggle_occluded_button.clicked.connect(self._mark_point_occluded)
         layout.addWidget(self.toggle_occluded_button)
 
         return card
@@ -1453,6 +1453,8 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             self.video_container.show_placeholder()
             self._update_timeline_position()
 
+        self._update_mark_stop_button_state()
+
     def seek_to_frame(self, frame_index: int, resume_playback: bool = False) -> None:
         if not self.video_player.is_loaded():
             return
@@ -1568,8 +1570,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
     def _draw_custom_traces(self, painter: QtGui.QPainter) -> None:
         current_index = self.video_player.current_frame_index if self.video_player.is_loaded() else None
         for tracked_point in self.custom_tracker.point_definitions().values():
-            if tracked_point.occluded:
-                continue
             history = tracked_point.history()
             trail_length = self.trail_length
             if current_index is not None:
@@ -1606,9 +1606,10 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
                 painter.drawLine(QtCore.QPointF(*prev_pos), QtCore.QPointF(*curr_pos))
 
     def _draw_custom_points(self, painter: QtGui.QPainter) -> None:
+        current_index = self.video_player.current_frame_index if self.video_player.is_loaded() else None
         for name, position in self.custom_tracker.current_positions.items():
             tracked_point = self.custom_tracker.point_definitions().get(name)
-            if not tracked_point or tracked_point.occluded:
+            if not tracked_point:
                 continue
             color = QtGui.QColor(*tracked_point.color)
             painter.setPen(QtGui.QPen(color, 2))
@@ -1623,7 +1624,11 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         for name, widgets in self.point_rows.items():
             tracked_point = self.custom_tracker.point_definitions().get(name)
             current_frame = frame_index
-            occluded = bool(tracked_point and tracked_point.occluded)
+            occluded = bool(
+                tracked_point
+                and current_frame is not None
+                and tracked_point.is_occluded(current_frame)
+            )
             absent = bool(
                 tracked_point and current_frame is not None and tracked_point.is_absent(current_frame)
             )
@@ -1763,7 +1768,10 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             self.mark_stop_button.setStyleSheet(off_style)
             return
 
-        if tracked_point.occluded:
+        current_frame = self.video_player.current_frame_index if self.video_player.is_loaded() else None
+        occlusion_open = tracked_point.open_occlusion_start is not None
+        frame_occluded = current_frame is not None and tracked_point.is_occluded(current_frame)
+        if occlusion_open or frame_occluded:
             self.mark_stop_button.setEnabled(False)
             self.mark_stop_button.setText("Mark Off-Frame")
             self.mark_stop_button.setStyleSheet(off_style)
@@ -2366,27 +2374,28 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             self._render_current_frame()
         self._mark_autosave_dirty()
 
-    def _toggle_point_occluded(self) -> None:
+    def _mark_point_occluded(self) -> None:
+        if not self.video_player.is_loaded():
+            return
         if self.active_point is None:
+            QtWidgets.QMessageBox.information(
+                self,
+                "No Point Selected",
+                "Select a point before updating its occlusion status.",
+            )
             return
         tracked_point = self.custom_tracker.point_definitions().get(self.active_point)
         if not tracked_point:
             return
-        new_value = not tracked_point.occluded
-        snapshot_added = self._record_undo_state("Toggle occluded")
-        if not self.custom_tracker.set_point_occluded(self.active_point, new_value):
+        frame_index = self.video_player.current_frame_index
+        total_frames = self.video_player.metadata.frame_count if self.video_player.metadata.frame_count > 0 else frame_index + 1
+        snapshot_added = self._record_undo_state("Toggle occlusion range")
+        if not self.custom_tracker.mark_occlusion_frame(self.active_point, frame_index, total_frames):
             if snapshot_added:
                 self._undo_manager.discard_last()
             return
-        self._log.debug("UI: toggle_occluded point=%s value=%s", self.active_point, new_value)
-        self._refresh_point_statuses()
-        if self.current_frame_bgr is not None:
-            self._render_current_frame()
-        self._update_timeline_markers()
-        self._update_timeline_absences()
-        self._update_mark_stop_button_state()
-        self._refresh_issue_panel()
-        self._mark_autosave_dirty()
+        self._log.debug("UI: mark_occlusion point=%s frame=%s", self.active_point, frame_index)
+        self._after_occlusion_changed(self.active_point)
 
     def _update_occluded_button_state(self) -> None:
         button = getattr(self, "toggle_occluded_button", None)
@@ -2433,9 +2442,12 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             button.setText("Mark Occluded")
             button.setStyleSheet(default_style)
             return
+        current_frame = self.video_player.current_frame_index if self.video_player.is_loaded() else None
+        occlusion_open = tracked_point.open_occlusion_start is not None
+        frame_occluded = current_frame is not None and tracked_point.is_occluded(current_frame)
         button.setEnabled(True)
-        if tracked_point.occluded:
-            button.setText("Clear Occluded")
+        if occlusion_open or frame_occluded:
+            button.setText("Mark Visible")
             button.setStyleSheet(active_style)
         else:
             button.setText("Mark Occluded")
@@ -2661,6 +2673,8 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             self.overview_timeline.set_markers(markers)
             self.detailed_timeline.set_segments([])
             self.overview_timeline.set_segments([])
+            self.detailed_timeline.set_occlusion_ranges([])
+            self.overview_timeline.set_occlusion_ranges([])
             return
 
         active_only = (
@@ -2705,6 +2719,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             provisional_color = QtGui.QColor(base_color)
             provisional_color.setAlpha(190)
             absence_color = QtGui.QColor(255, 80, 80, 170)
+            occlusion_color = QtGui.QColor(120, 150, 255, 170)
 
             manual_frames = set(tracked_point.accepted_keyframe_frames())
             for frame in manual_frames:
@@ -2726,6 +2741,14 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
 
             if tracked_point.open_absence_start is not None:
                 register_marker(point_name, tracked_point.open_absence_start, absence_color, "stop", 100)
+
+            for start, end in tracked_point.occluded_ranges:
+                register_marker(point_name, start, occlusion_color, "occlusion_start", 95)
+                resume_frame = end + 1
+                register_marker(point_name, resume_frame, occlusion_color, "occlusion_end", 95)
+
+            if tracked_point.open_occlusion_start is not None:
+                register_marker(point_name, tracked_point.open_occlusion_start, occlusion_color, "occlusion_start", 95)
 
         markers = [entry[1] for entry in sorted(marker_records.values(), key=lambda item: (item[1].frame, item[1].point_name or ""))]
         self._marker_lookup = {(marker.point_name or "", marker.frame): marker for marker in markers}
@@ -2761,19 +2784,31 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             self.tracking_manager.request_point(point_name)
 
     def _update_timeline_absences(self) -> None:
-        ranges: List[Tuple[int, int]] = []
+        absence_ranges: List[Tuple[int, int]] = []
+        occlusion_ranges: List[Tuple[int, int]] = []
         if self.video_player.is_loaded() and self.active_point:
             tracked_point = self.custom_tracker.point_definitions().get(self.active_point)
             if tracked_point:
-                ranges = list(tracked_point.absent_ranges)
+                absence_ranges = list(tracked_point.absent_ranges)
                 if tracked_point.open_absence_start is not None:
                     metadata = self.video_player.metadata
                     last_frame = metadata.frame_count - 1 if metadata.frame_count > 0 else self.video_player.current_frame_index
                     last_frame = max(tracked_point.open_absence_start, last_frame)
-                    ranges.append((tracked_point.open_absence_start, last_frame))
-                ranges.sort(key=lambda item: item[0])
-        self.detailed_timeline.set_absence_ranges(ranges)
-        self.overview_timeline.set_absence_ranges(ranges)
+                    absence_ranges.append((tracked_point.open_absence_start, last_frame))
+                absence_ranges.sort(key=lambda item: item[0])
+
+                occlusion_ranges = list(tracked_point.occluded_ranges)
+                if tracked_point.open_occlusion_start is not None:
+                    metadata = self.video_player.metadata
+                    last_frame = metadata.frame_count - 1 if metadata.frame_count > 0 else self.video_player.current_frame_index
+                    last_frame = max(tracked_point.open_occlusion_start, last_frame)
+                    occlusion_ranges.append((tracked_point.open_occlusion_start, last_frame))
+                occlusion_ranges.sort(key=lambda item: item[0])
+
+        self.detailed_timeline.set_absence_ranges(absence_ranges)
+        self.overview_timeline.set_absence_ranges(absence_ranges)
+        self.detailed_timeline.set_occlusion_ranges(occlusion_ranges)
+        self.overview_timeline.set_occlusion_ranges(occlusion_ranges)
 
     @property
     def trail_length(self) -> int:
@@ -2812,6 +2847,15 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
                             handled = True
                         elif snapshot_added:
                             self._undo_manager.discard_last()
+                    elif marker.category in {"occlusion_start", "occlusion_end"} and target_point:
+                        snapshot_added = self._record_undo_state("Remove occlusion range")
+                        if self.custom_tracker.remove_occlusion_segment(target_point, frame_index):
+                            self._selected_marker = None
+                            self.detailed_timeline.set_selected_marker(None, None)
+                            self._after_occlusion_changed(target_point)
+                            handled = True
+                        elif snapshot_added:
+                            self._undo_manager.discard_last()
             if not handled and self.active_point and self.video_player.is_loaded():
                 current_frame = self.video_player.current_frame_index
                 snapshot_added = self._record_undo_state("Remove stop frame")
@@ -2820,6 +2864,13 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
                     handled = True
                 elif snapshot_added:
                     self._undo_manager.discard_last()
+                if not handled:
+                    snapshot_added = self._record_undo_state("Remove occlusion range")
+                    if self.custom_tracker.remove_occlusion_segment(self.active_point, current_frame):
+                        self._after_occlusion_changed(self.active_point)
+                        handled = True
+                    elif snapshot_added:
+                        self._undo_manager.discard_last()
             if handled:
                 event.accept()
                 return
@@ -2829,6 +2880,13 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
                 snapshot_added = self._record_undo_state("Split stop frame")
                 if self.custom_tracker.split_absence_segment(self.active_point, frame_index):
                     self._after_absence_changed(self.active_point)
+                    event.accept()
+                    return
+                elif snapshot_added:
+                    self._undo_manager.discard_last()
+                snapshot_added = self._record_undo_state("Split occlusion range")
+                if self.custom_tracker.split_occlusion_segment(self.active_point, frame_index):
+                    self._after_occlusion_changed(self.active_point)
                     event.accept()
                     return
                 elif snapshot_added:
@@ -2850,6 +2908,18 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._update_timeline_markers()
         self.tracking_manager.request_point(point_name)
         self._render_current_frame()
+        self._update_mark_stop_button_state()
+        self._mark_autosave_dirty()
+
+    def _after_occlusion_changed(self, point_name: str) -> None:
+        self._refresh_point_statuses()
+        self._update_timeline_absences()
+        self._update_timeline_markers()
+        self.tracking_manager.request_point(point_name)
+        if self.current_frame_bgr is not None:
+            self._render_current_frame()
+        self._update_mark_stop_button_state()
+        self._refresh_issue_panel()
         self._mark_autosave_dirty()
 
     def _close_tracking_jobs_popup(self) -> None:

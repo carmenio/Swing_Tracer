@@ -93,7 +93,8 @@ class CustomPointTracker:
                 not tracked_point.keyframes
                 and not tracked_point.absent_ranges
                 and tracked_point.open_absence_start is None
-                and not tracked_point.occluded
+                and not tracked_point.occluded_ranges
+                and tracked_point.open_occlusion_start is None
             ):
                 continue
             keyframes = {
@@ -105,7 +106,8 @@ class CustomPointTracker:
                 "accepted": list(tracked_point.accepted_keyframes),
                 "absences": [[int(start), int(end)] for start, end in tracked_point.absent_ranges],
                 "open_absence": tracked_point.open_absence_start,
-                "occluded": tracked_point.occluded,
+                "occlusions": [[int(start), int(end)] for start, end in tracked_point.occluded_ranges],
+                "open_occlusion": tracked_point.open_occlusion_start,
             }
             pristine = self._segment_pristine.get(name, {})
             if pristine:
@@ -149,7 +151,18 @@ class CustomPointTracker:
                     self._apply_absence_range(tracked_point, start, end)
             open_absence = payload.get("open_absence")
             tracked_point.open_absence_start = int(open_absence) if isinstance(open_absence, int) else None
-            tracked_point.occluded = bool(payload.get("occluded", False))
+            occlusions = payload.get("occlusions", [])
+            tracked_point.clear_occlusion_ranges()
+            if isinstance(occlusions, list):
+                for entry in occlusions:
+                    try:
+                        start, end = int(entry[0]), int(entry[1])
+                    except Exception:
+                        continue
+                    tracked_point.add_occlusion(start, end)
+                    self._apply_occlusion_range(tracked_point, start, end)
+            open_occlusion = payload.get("open_occlusion")
+            tracked_point.open_occlusion_start = int(open_occlusion) if isinstance(open_occlusion, int) else None
             segments_payload = payload.get("segments")
             if isinstance(segments_payload, list):
                 status_map: Dict[Tuple[int, int], bool] = {}
@@ -228,30 +241,103 @@ class CustomPointTracker:
             return True
         return False
 
-    def is_point_occluded(self, point_name: str) -> bool:
+    def point_occlusion_ranges(self, point_name: str) -> List[Tuple[int, int]]:
         tracked_point = self.points.get(point_name)
-        return bool(tracked_point and tracked_point.occluded)
+        if not tracked_point:
+            return []
+        return list(tracked_point.occluded_ranges)
 
-    def set_point_occluded(self, point_name: str, value: bool) -> bool:
+    def clear_point_occlusions(self, point_name: str) -> None:
+        tracked_point = self.points.get(point_name)
+        if not tracked_point:
+            return
+        tracked_point.clear_occlusion_ranges()
+        self._invalidate_point_cache(point_name)
+
+    def mark_occlusion_frame(self, point_name: str, frame_index: int, total_frames: int) -> bool:
         tracked_point = self.points.get(point_name)
         if not tracked_point:
             return False
-        value = bool(value)
-        if tracked_point.occluded == value:
+
+        max_index = total_frames - 1 if total_frames > 0 else frame_index
+        frame_index = max(0, min(frame_index, max_index))
+
+        current_start = tracked_point.open_occlusion_start
+        if current_start is None:
+            tracked_point.open_occlusion_start = frame_index
+            tracked_point.remove_occlusion_at(frame_index)
+            self._invalidate_point_cache(point_name)
+            return True
+
+        if frame_index <= current_start:
             return False
-        tracked_point.occluded = value
-        if value:
-            self.current_positions.pop(point_name, None)
-            tracked_point.smoothed_position = None
-            tracked_point.last_frame_index = None
+
+        end_frame = frame_index - 1
+        occlusion_start = current_start + 1
+        if occlusion_start <= end_frame:
+            tracked_point.add_occlusion(occlusion_start, end_frame)
+            self._apply_occlusion_range(tracked_point, occlusion_start, end_frame)
+        tracked_point.open_occlusion_start = None
+        tracked_point.end_occlusion_at(frame_index)
         self._invalidate_point_cache(point_name)
         return True
 
-    def toggle_point_occluded(self, point_name: str) -> bool:
+    def remove_occlusion_segment(self, point_name: str, frame_index: int) -> bool:
         tracked_point = self.points.get(point_name)
         if not tracked_point:
             return False
-        return self.set_point_occluded(point_name, not tracked_point.occluded)
+
+        frame_index = int(frame_index)
+        removed = False
+        new_ranges: List[Tuple[int, int]] = []
+        for start, end in tracked_point.occluded_ranges:
+            if start <= frame_index <= end or start <= frame_index - 1 <= end:
+                removed = True
+                continue
+            new_ranges.append((start, end))
+        if removed:
+            tracked_point.occluded_ranges = sorted(new_ranges)
+
+        open_start = tracked_point.open_occlusion_start
+        if open_start is not None and frame_index >= open_start:
+            tracked_point.open_occlusion_start = None
+            removed = True
+
+        if removed:
+            self._invalidate_point_cache(point_name)
+        return removed
+
+    def split_occlusion_segment(self, point_name: str, frame_index: int) -> bool:
+        tracked_point = self.points.get(point_name)
+        if not tracked_point:
+            return False
+
+        frame_index = int(frame_index)
+        for start, end in list(tracked_point.occluded_ranges):
+            if start < frame_index <= end:
+                if frame_index == start:
+                    return False
+                tracked_point.occluded_ranges.remove((start, end))
+                if start <= frame_index - 1:
+                    tracked_point.add_occlusion(start, frame_index - 1)
+                if frame_index <= end:
+                    tracked_point.add_occlusion(frame_index, end)
+                self._invalidate_point_cache(point_name)
+                return True
+
+        open_start = tracked_point.open_occlusion_start
+        if open_start is not None and frame_index > open_start + 1:
+            tracked_point.add_occlusion(open_start + 1, frame_index - 1)
+            tracked_point.open_occlusion_start = frame_index
+            self._invalidate_point_cache(point_name)
+            return True
+        return False
+
+    def is_point_occluded_at(self, point_name: str, frame_index: int) -> bool:
+        tracked_point = self.points.get(point_name)
+        if not tracked_point:
+            return False
+        return tracked_point.is_occluded(frame_index)
 
     def set_frame_loader(self, loader: Optional[Callable[[int], Optional[object]]]) -> None:
         """Register a callback that returns a BGR frame for the given index."""
@@ -421,7 +507,7 @@ class CustomPointTracker:
 
     def ensure_all_spans(self, point_name: str) -> None:
         tracked_point = self.points.get(point_name)
-        if not tracked_point or tracked_point.occluded:
+        if not tracked_point:
             return
         for span in self._iter_span_pairs(tracked_point):
             self._get_chain(point_name, span)
@@ -430,7 +516,9 @@ class CustomPointTracker:
         self, point_name: str, frame_index: int
     ) -> Optional[ProvisionalChain]:
         tracked_point = self.points.get(point_name)
-        if not tracked_point or tracked_point.occluded:
+        if not tracked_point:
+            return None
+        if tracked_point.is_occluded(frame_index):
             return None
         span = self._span_for_frame(tracked_point, frame_index)
         if span is None:
@@ -440,15 +528,9 @@ class CustomPointTracker:
     def provisional_chain_for_span(
         self, point_name: str, span: Tuple[int, int]
     ) -> Optional[ProvisionalChain]:
-        tracked_point = self.points.get(point_name)
-        if tracked_point and tracked_point.occluded:
-            return None
         return self._get_chain(point_name, span)
 
     def all_provisional_candidates(self, point_name: str) -> List[AnchorMetrics]:
-        tracked_point = self.points.get(point_name)
-        if tracked_point and tracked_point.occluded:
-            return []
         self.ensure_all_spans(point_name)
         cache = self._provisional_cache.get(point_name, {})
         anchors: List[AnchorMetrics] = []
@@ -461,9 +543,6 @@ class CustomPointTracker:
         return self.all_provisional_candidates(point_name)
 
     def count_provisionals(self, point_name: str) -> int:
-        tracked_point = self.points.get(point_name)
-        if tracked_point and tracked_point.occluded:
-            return 0
         self.ensure_all_spans(point_name)
         cache = self._provisional_cache.get(point_name, {})
         return sum(chain.total_provisionals() for chain in cache.values())
@@ -471,8 +550,6 @@ class CustomPointTracker:
     def tracking_segments(self, point_name: str) -> List[TrackingSegment]:
         tracked_point = self.points.get(point_name)
         if not tracked_point:
-            return []
-        if tracked_point.occluded:
             return []
         segments: List[TrackingSegment] = []
         status_map = self._segment_pristine.get(point_name, {})
@@ -497,9 +574,6 @@ class CustomPointTracker:
     def all_tracking_segments(self) -> List[TrackingSegment]:
         segments: List[TrackingSegment] = []
         for point_name in self.points.keys():
-            tracked_point = self.points.get(point_name)
-            if tracked_point and tracked_point.occluded:
-                continue
             segments.extend(self.tracking_segments(point_name))
         segments.sort(key=lambda segment: (segment.start_key.frame, segment.end_key.frame, segment.point_name or ""))
         return segments
@@ -555,15 +629,17 @@ class CustomPointTracker:
 
     def span_pairs(self, point_name: str) -> List[Tuple[int, int]]:
         tracked_point = self.points.get(point_name)
-        if not tracked_point or tracked_point.occluded:
+        if not tracked_point:
             return []
         return list(self._iter_span_pairs(tracked_point))
 
     def requires_tracking(self, point_name: str, span: Tuple[int, int]) -> bool:
         dirty_spans = self._segment_dirty.get(point_name, set())
         tracked_point = self.points.get(point_name)
-        if tracked_point and tracked_point.occluded:
-            return False
+        if tracked_point:
+            start_frame, end_frame = span
+            if all(tracked_point.is_occluded(frame) for frame in range(start_frame, end_frame + 1)):
+                return False
         if span in dirty_spans:
             return True
         result_map = self._segment_results.get(point_name, {})
@@ -591,14 +667,6 @@ class CustomPointTracker:
         if not tracked_point:
             return
 
-        if tracked_point.occluded:
-            self._log.debug(
-                "apply_segment_result: point=%s span=%s ignored (occluded)",
-                point_name,
-                span,
-            )
-            return
-
         if result is None:
             # Leave the span dirty so the manager can retry later.
             self._mark_span_dirty(point_name, span)
@@ -614,6 +682,8 @@ class CustomPointTracker:
         is_pristine = self._segment_is_pristine(result)
         for frame_index, position in result.optical_flow.positions.items():
             if frame_index in tracked_point.keyframes:
+                continue
+            if tracked_point.is_occluded(frame_index):
                 continue
             tracked_point.positions[frame_index] = position
             tracked_point.confidence[frame_index] = result.optical_flow.confidences.get(frame_index, 0.0)
@@ -716,9 +786,6 @@ class CustomPointTracker:
             self._store_frame(frame_index, frame_bgr)
 
         for point_name, tracked_point in self.points.items():
-            if tracked_point.occluded:
-                self.current_positions.pop(point_name, None)
-                continue
             if not tracked_point.keyframes:
                 continue
             if tracked_point.is_absent(frame_index):
@@ -730,7 +797,6 @@ class CustomPointTracker:
                 tracked_point.smoothed_position = None
                 tracked_point.last_frame_index = frame_index
                 continue
-
             expected = self._expected_position(tracked_point, frame_index)
             if expected is None:
                 continue
@@ -752,8 +818,6 @@ class CustomPointTracker:
             "set_manual_point start point=%s frame=%s position=%s", point_name, frame_index, position
         )
         tracked_point = self.points[point_name]
-        if tracked_point.occluded:
-            tracked_point.occluded = False
         was_absent = tracked_point.is_absent(frame_index)
         open_start = tracked_point.open_absence_start
         tracked_point.remove_absence_at(frame_index)
@@ -858,6 +922,12 @@ class CustomPointTracker:
                 marker_map[resume_frame] = "start"
             if tracked_point.open_absence_start is not None:
                 marker_map[tracked_point.open_absence_start] = "stop"
+            for start, end in tracked_point.occluded_ranges:
+                marker_map[start] = "occlusion_start"
+                resume_frame = end + 1
+                marker_map[resume_frame] = "occlusion_end"
+            if tracked_point.open_occlusion_start is not None:
+                marker_map[tracked_point.open_occlusion_start] = "occlusion_start"
         return marker_map
 
     def point_definitions(self) -> Dict[str, TrackedPoint]:
@@ -1101,6 +1171,10 @@ class CustomPointTracker:
             tracked_point.smoothed_position = None
 
         self.current_positions.pop(tracked_point.name, None)
+
+    def _apply_occlusion_range(self, tracked_point: TrackedPoint, start_frame: int, end_frame: int) -> None:
+        # Occlusions are metadata overlays; keep recorded positions so the user can still see and edit them.
+        self._invalidate_point_cache(tracked_point.name)
 
     def _trim_history(self, tracked_point: TrackedPoint, current_frame: int) -> None:
         if self.max_history_frames <= 0:

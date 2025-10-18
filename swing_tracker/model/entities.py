@@ -35,7 +35,8 @@ class TrackedPoint:
     last_frame_index: Optional[int] = None
     absent_ranges: List[Tuple[int, int]] = field(default_factory=list)
     open_absence_start: Optional[int] = None
-    occluded: bool = False
+    occluded_ranges: List[Tuple[int, int]] = field(default_factory=list)
+    open_occlusion_start: Optional[int] = None
 
     def record(
         self,
@@ -101,7 +102,8 @@ class TrackedPoint:
         self.last_frame_index = None
         self.absent_ranges.clear()
         self.open_absence_start = None
-        self.occluded = False
+        self.occluded_ranges.clear()
+        self.open_occlusion_start = None
 
     def set_keyframe(self, frame_index: int, position: Point2D, *, accepted: bool = False) -> None:
         self.keyframes[frame_index] = position
@@ -192,3 +194,61 @@ class TrackedPoint:
             else:
                 updated.append((start, end))
         self.absent_ranges = [(s, e) for s, e in updated if s <= e]
+
+    def add_occlusion(self, start: int, end: int) -> None:
+        if start > end:
+            start, end = end, start
+        merged: List[Tuple[int, int]] = []
+        inserted = False
+        for existing_start, existing_end in self.occluded_ranges:
+            if end < existing_start - 1:
+                if not inserted:
+                    merged.append((start, end))
+                    inserted = True
+                merged.append((existing_start, existing_end))
+            elif start > existing_end + 1:
+                merged.append((existing_start, existing_end))
+            else:
+                start = min(start, existing_start)
+                end = max(end, existing_end)
+        if not inserted:
+            merged.append((start, end))
+        self.occluded_ranges = sorted(merged)
+
+    def remove_occlusion_at(self, frame_index: int) -> None:
+        updated: List[Tuple[int, int]] = []
+        for start, end in self.occluded_ranges:
+            if frame_index < start or frame_index > end:
+                updated.append((start, end))
+                continue
+            if start <= frame_index - 1:
+                updated.append((start, frame_index - 1))
+            if frame_index + 1 <= end:
+                updated.append((frame_index + 1, end))
+        self.occluded_ranges = sorted((s, e) for s, e in updated if s <= e)
+
+    def clear_occlusion_ranges(self) -> None:
+        self.occluded_ranges.clear()
+        self.open_occlusion_start = None
+
+    def is_occluded(self, frame_index: int) -> bool:
+        if self.open_occlusion_start is not None and frame_index >= self.open_occlusion_start:
+            return True
+        for start, end in self.occluded_ranges:
+            if start <= frame_index <= end:
+                return True
+        return False
+
+    def end_occlusion_at(self, frame_index: int) -> None:
+        updated: List[Tuple[int, int]] = []
+        if self.open_occlusion_start is not None and frame_index >= self.open_occlusion_start:
+            self.open_occlusion_start = None
+        for start, end in self.occluded_ranges:
+            if frame_index < start:
+                updated.append((start, end))
+            elif frame_index <= end:
+                if start <= frame_index - 1:
+                    updated.append((start, frame_index - 1))
+            else:
+                updated.append((start, end))
+        self.occluded_ranges = [(s, e) for s, e in updated if s <= e]

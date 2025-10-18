@@ -215,10 +215,6 @@ class TrackingManager(QtCore.QObject):
             return
         if not point_name:
             return
-        tracked_point = self._tracker.point_definitions().get(point_name)
-        if tracked_point and getattr(tracked_point, "occluded", False):
-            self._log.debug("TrackingManager: point %s occluded, skipping", point_name)
-            return
         spans = self._tracker.span_pairs(point_name)
         if not spans:
             return
@@ -336,9 +332,9 @@ class TrackingManager(QtCore.QObject):
         tracked_point = self._tracker.point_definitions().get(point_name)
         if not tracked_point:
             return None
-        if getattr(tracked_point, "occluded", False):
-            return None
         start_frame, end_frame = span
+        if tracked_point.is_occluded(start_frame) or tracked_point.is_occluded(end_frame):
+            return None
         start_pos = tracked_point.keyframes.get(start_frame)
         end_pos = tracked_point.keyframes.get(end_frame)
         if start_pos is None or end_pos is None:

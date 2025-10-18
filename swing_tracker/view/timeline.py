@@ -25,6 +25,10 @@ def marker_line_color(marker: TimelineMarker) -> QtGui.QColor:
         color = QtGui.QColor(255, 80, 80)
         color.setAlpha(150)
         return color
+    if marker.category in {"occlusion_start", "occlusion_end"}:
+        color = QtGui.QColor(120, 150, 255)
+        color.setAlpha(150)
+        return color
     color = QtGui.QColor(marker.color)
     if marker.category == "provisional":
         if color.alpha() > 190:
@@ -54,6 +58,7 @@ class DetailedTimeline(QtWidgets.QWidget):
         self.viewport_range: Tuple[float, float] = (0.0, 100.0)
         self.markers: List[TimelineMarker] = []
         self.absence_ranges: List[Tuple[int, int]] = []
+        self.occlusion_ranges: List[Tuple[int, int]] = []
         self.frame_map: List[int] = []
         self._marker_frames: List[int] = []
         self._hit_regions: List[Tuple[int, Optional[str], QtCore.QPointF, float]] = []
@@ -134,6 +139,39 @@ class DetailedTimeline(QtWidgets.QWidget):
         normalized.sort()
         if self.absence_ranges != normalized:
             self.absence_ranges = normalized
+            self.update()
+
+    def set_occlusion_ranges(self, ranges: Iterable[Tuple[int, int]]) -> None:
+        normalized: List[Tuple[int, int]] = []
+        for start, end in ranges:
+            start_i = max(0, int(start))
+            end_i = max(start_i, int(end))
+            normalized.append((start_i, end_i))
+        normalized.sort()
+        if self.occlusion_ranges != normalized:
+            self.occlusion_ranges = normalized
+            self.update()
+
+    def set_occlusion_ranges(self, ranges: Iterable[Tuple[int, int]]) -> None:
+        normalized: List[Tuple[int, int]] = []
+        for start, end in ranges:
+            start_i = max(0, int(start))
+            end_i = max(start_i, int(end))
+            normalized.append((start_i, end_i))
+        normalized.sort()
+        if self.occlusion_ranges != normalized:
+            self.occlusion_ranges = normalized
+            self.update()
+
+    def set_occlusion_ranges(self, ranges: Iterable[Tuple[int, int]]) -> None:
+        normalized: List[Tuple[int, int]] = []
+        for start, end in ranges:
+            start_i = max(0, int(start))
+            end_i = max(start_i, int(end))
+            normalized.append((start_i, end_i))
+        normalized.sort()
+        if self.occlusion_ranges != normalized:
+            self.occlusion_ranges = normalized
             self.update()
 
     def set_frame_map(self, frames: Iterable[int]) -> None:
@@ -232,6 +270,30 @@ class DetailedTimeline(QtWidgets.QWidget):
                 painter.drawRect(QtCore.QRectF(left, content.top(), max(1.0, right - left), content.height()))
             painter.restore()
 
+        if self.occlusion_ranges:
+            painter.save()
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(QtGui.QColor(120, 150, 255, 80))
+            for start, end in self.occlusion_ranges:
+                if end < view_start_frame:
+                    continue
+                if start > view_end_frame:
+                    continue
+                start_pos = self._position_for_frame(start)
+                end_pos = self._position_for_frame(end + 1)
+                if start_pos is None or end_pos is None:
+                    continue
+                if end_pos <= start_pos:
+                    continue
+                if end_pos < start_index or start_pos > end_index:
+                    continue
+                clamped_start = max(start_index, start_pos)
+                clamped_end = min(end_index, end_pos)
+                left = content.left() + ((clamped_start - start_index) / span) * content.width()
+                right = content.left() + ((clamped_end - start_index) / span) * content.width()
+                painter.drawRect(QtCore.QRectF(left, content.top(), max(1.0, right - left), content.height()))
+            painter.restore()
+
         visible_markers = self._visible_markers_in_view(start_index, end_index, view_start_frame, view_end_frame)
         if visible_markers:
             visible_markers.sort(key=lambda item: item[1])
@@ -270,18 +332,22 @@ class DetailedTimeline(QtWidgets.QWidget):
                     base_radius = 2.6
                 elif marker.category == "provisional":
                     base_radius = 3.0
-                elif marker.category in {"start", "stop"}:
+                elif marker.category in {"start", "stop", "occlusion_start", "occlusion_end"}:
                     base_radius = 3.6
 
                 marker_key = (marker.point_name or "", marker.frame)
                 selected = self._selected_marker == marker_key
-                fill_marker = marker.category not in {"provisional", "start", "stop"}
+                fill_marker = marker.category not in {"provisional", "start", "stop", "occlusion_start", "occlusion_end"}
                 outline_color = QtGui.QColor("#101010")
                 pen_width = 1.0
                 if marker.category == "provisional":
                     outline_color = point_color
                 if marker.category in {"start", "stop"}:
                     outline_color = QtGui.QColor(255, 80, 80, 180)
+                    fill_marker = False
+                if marker.category in {"occlusion_start", "occlusion_end"}:
+                    outline_color = QtGui.QColor(120, 150, 255, 190)
+                    point_color = QtGui.QColor(120, 150, 255, 190)
                     fill_marker = False
 
                 painter.setBrush(QtGui.QBrush(point_color) if fill_marker else QtCore.Qt.NoBrush)
@@ -555,6 +621,7 @@ class OverviewTimeline(QtWidgets.QWidget):
         self.viewport_range: Tuple[float, float] = (0.0, 100.0)
         self.markers: List[TimelineMarker] = []
         self.absence_ranges: List[Tuple[int, int]] = []
+        self.occlusion_ranges: List[Tuple[int, int]] = []
         self.frame_map: List[int] = []
         self.segments: List[TrackingSegment] = []
         self._segment_lookup: Dict[Tuple[int, int], TrackingSegment] = {}
@@ -631,6 +698,17 @@ class OverviewTimeline(QtWidgets.QWidget):
         normalized.sort()
         if self.absence_ranges != normalized:
             self.absence_ranges = normalized
+            self.update()
+
+    def set_occlusion_ranges(self, ranges: Iterable[Tuple[int, int]]) -> None:
+        normalized: List[Tuple[int, int]] = []
+        for start, end in ranges:
+            start_i = max(0, int(start))
+            end_i = max(start_i, int(end))
+            normalized.append((start_i, end_i))
+        normalized.sort()
+        if self.occlusion_ranges != normalized:
+            self.occlusion_ranges = normalized
             self.update()
 
     def set_frame_map(self, frames: Iterable[int]) -> None:
@@ -715,6 +793,38 @@ class OverviewTimeline(QtWidgets.QWidget):
             painter.setPen(QtCore.Qt.NoPen)
             painter.setBrush(QtGui.QColor(255, 140, 105, 70))
             for start, end in self.absence_ranges:
+                start_pos = self._position_for_frame(start)
+                end_pos = self._position_for_frame(end + 1)
+                if start_pos is None or end_pos is None or end_pos <= start_pos:
+                    continue
+                left_ratio = (start_pos / total_span) if total_span else 0.0
+                right_ratio = (end_pos / total_span) if total_span else 1.0
+                left = content.left() + left_ratio * content.width()
+                right = content.left() + right_ratio * content.width()
+                painter.drawRect(QtCore.QRectF(left, content.top(), max(1.0, right - left), content.height()))
+            painter.restore()
+
+        if self.occlusion_ranges:
+            painter.save()
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(QtGui.QColor(120, 150, 255, 60))
+            for start, end in self.occlusion_ranges:
+                start_pos = self._position_for_frame(start)
+                end_pos = self._position_for_frame(end + 1)
+                if start_pos is None or end_pos is None or end_pos <= start_pos:
+                    continue
+                left_ratio = (start_pos / total_span) if total_span else 0.0
+                right_ratio = (end_pos / total_span) if total_span else 1.0
+                left = content.left() + left_ratio * content.width()
+                right = content.left() + right_ratio * content.width()
+                painter.drawRect(QtCore.QRectF(left, content.top(), max(1.0, right - left), content.height()))
+            painter.restore()
+
+        if self.occlusion_ranges:
+            painter.save()
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(QtGui.QColor(120, 150, 255, 60))
+            for start, end in self.occlusion_ranges:
                 start_pos = self._position_for_frame(start)
                 end_pos = self._position_for_frame(end + 1)
                 if start_pos is None or end_pos is None or end_pos <= start_pos:
