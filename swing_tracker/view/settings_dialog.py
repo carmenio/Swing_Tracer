@@ -261,6 +261,10 @@ class SettingsDialog(QtWidgets.QDialog):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(18)
 
+        self.track_enabled_checkbox = QtWidgets.QCheckBox("Enable Tracking")
+        self.track_enabled_checkbox.setToolTip("When disabled, no automatic tracking jobs will run.")
+        layout.addWidget(self.track_enabled_checkbox)
+
         form = QtWidgets.QFormLayout()
         form.setLabelAlignment(QtCore.Qt.AlignLeft)
         form.setFormAlignment(QtCore.Qt.AlignTop)
@@ -612,6 +616,9 @@ class SettingsDialog(QtWidgets.QDialog):
         index = self.general_theme.findText(g.theme)
         self.general_theme.setCurrentIndex(max(0, index))
 
+        tr = self.settings.tracking
+        self.track_enabled_checkbox.setChecked(tr.tracking_enabled)
+
         tl = self.settings.timeline
         for key, btn in self.timeline_color_buttons.items():
             color = tl.marker_colors.get(key, "#ffffff")
@@ -698,6 +705,7 @@ class SettingsDialog(QtWidgets.QDialog):
         tr.smoothing_alpha = self.track_smoothing_alpha.value()
         tr.performance_mode = self.track_performance_mode.currentText()
         tr.thread_priority = self.track_thread_priority.currentText()
+        tr.tracking_enabled = self.track_enabled_checkbox.isChecked()
 
         tl = self.settings.timeline
         for key, btn in self.timeline_color_buttons.items():

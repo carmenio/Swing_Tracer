@@ -113,6 +113,7 @@ class TrackingSegment:
         provisional_points (List[KeyFrame]): Any extra points (e.g., intermediate differences).
         accepted (bool): Whether the segment has been accepted.
         entity_colour (Optional[str]): A specific color associated with this tracking entity.
+        difference_free (bool): True when tracking matched interpolation with no detected deviations.
     """
     start_key: KeyFrame
     end_key: KeyFrame
@@ -123,6 +124,7 @@ class TrackingSegment:
     accepted: bool = False
     entity_colour: Optional[str] = None
     point_name: Optional[str] = None
+    difference_free: bool = False
 
     def color_stops(self) -> List[Tuple[int, str]]:
         """

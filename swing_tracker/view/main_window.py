@@ -2378,12 +2378,18 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         dialog.exec_()
 
     def _apply_new_settings(self, new_settings: AppSettings) -> None:
+        previous_enabled = self.settings.tracking.tracking_enabled
         self.settings_manager.settings = new_settings
         self.settings_manager.save()
         self.settings = self.settings_manager.settings
         self._apply_settings_to_ui()
         self._update_timeline_markers()
         self._refresh_issue_panel()
+        current_enabled = self.settings.tracking.tracking_enabled
+        if previous_enabled and not current_enabled:
+            self.tracking_manager.reset()
+        elif not previous_enabled and current_enabled:
+            self.tracking_manager.request_all()
 
     def _timeline_frame_map(self) -> List[int]:
         if not self.video_player.is_loaded():

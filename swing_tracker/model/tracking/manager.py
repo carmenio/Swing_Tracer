@@ -210,6 +210,9 @@ class TrackingManager(QtCore.QObject):
         self._active_workers: Dict[int, TrackingWorker] = {}
 
     def request_point(self, point_name: Optional[str]) -> None:
+        if not self._tracker.tracking_enabled:
+            self._log.debug("TrackingManager: tracking disabled, skipping request for %s", point_name)
+            return
         if not point_name:
             return
         spans = self._tracker.span_pairs(point_name)
@@ -232,6 +235,9 @@ class TrackingManager(QtCore.QObject):
             self._start_job(config)
 
     def request_all(self) -> None:
+        if not self._tracker.tracking_enabled:
+            self._log.debug("TrackingManager: tracking disabled, skipping request_all")
+            return
         for point_name in self._tracker.point_definitions().keys():
             self.request_point(point_name)
 
@@ -376,6 +382,12 @@ class TrackingManager(QtCore.QObject):
         )
 
     def _start_job(self, config: TrackingJobConfig) -> None:
+        if not self._tracker.tracking_enabled:
+            self._log.debug(
+                "TrackingManager: tracking disabled, refusing to start job=%s",
+                config.job_id,
+            )
+            return
         state = self._job_states.get(config.job_id)
         is_new = state is None
         if state is None:

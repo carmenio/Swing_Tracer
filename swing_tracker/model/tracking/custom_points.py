@@ -54,6 +54,7 @@ class CustomPointTracker:
         self.performance_mode: str = "Balanced"
         self.thread_priority: str = "Normal"
         self.cache_frames_enabled: bool = True
+        self.tracking_enabled: bool = True
         self._provisional_cache: Dict[str, Dict[Tuple[int, int], ProvisionalChain]] = {}
         self._provisional_rejections: Dict[str, Dict[Tuple[int, int], Set[int]]] = {}
         self._provisional_dirty: Dict[str, Set[Tuple[int, int]]] = {}
@@ -61,6 +62,7 @@ class CustomPointTracker:
         self._frame_order: Deque[int] = deque()
         self._segment_results: Dict[str, Dict[Tuple[int, int], SegmentBuildResult]] = {}
         self._segment_dirty: Dict[str, Set[Tuple[int, int]]] = {}
+        self._segment_pristine: Dict[str, Dict[Tuple[int, int], bool]] = {}
         self._frame_loader: Optional[Callable[[int], Optional[object]]] = None
         self._frame_lock = threading.RLock()
 
@@ -99,10 +101,23 @@ class CustomPointTracker:
                 "absences": [[int(start), int(end)] for start, end in tracked_point.absent_ranges],
                 "open_absence": tracked_point.open_absence_start,
             }
+            pristine = self._segment_pristine.get(name, {})
+            if pristine:
+                segments_payload = [
+                    {
+                        "start": int(span[0]),
+                        "end": int(span[1]),
+                        "difference_free": bool(flag),
+                    }
+                    for span, flag in pristine.items()
+                ]
+                segments_payload.sort(key=lambda item: (item["start"], item["end"]))
+                payload[name]["segments"] = segments_payload
         return payload
 
     def load_state(self, data: Dict[str, Dict[str, object]]) -> None:
         self.reset()
+        loaded_pristine: Dict[str, Dict[Tuple[int, int], bool]] = {}
         for name, payload in data.items():
             tracked_point = self.points.get(name)
             if not tracked_point:
@@ -128,7 +143,29 @@ class CustomPointTracker:
                     self._apply_absence_range(tracked_point, start, end)
             open_absence = payload.get("open_absence")
             tracked_point.open_absence_start = int(open_absence) if isinstance(open_absence, int) else None
+            segments_payload = payload.get("segments")
+            if isinstance(segments_payload, list):
+                status_map: Dict[Tuple[int, int], bool] = {}
+                for entry in segments_payload:
+                    if not isinstance(entry, dict):
+                        continue
+                    try:
+                        start = int(entry.get("start"))
+                        end = int(entry.get("end"))
+                    except (TypeError, ValueError):
+                        continue
+                    if start >= end:
+                        continue
+                    if start not in tracked_point.keyframes or end not in tracked_point.keyframes:
+                        continue
+                    raw_flag = entry.get("difference_free")
+                    if raw_flag is None:
+                        raw_flag = entry.get("no_difference")
+                    status_map[(start, end)] = bool(raw_flag)
+                if status_map:
+                    loaded_pristine[name] = status_map
         self._invalidate_point_cache()
+        self._segment_pristine = loaded_pristine
 
     def remove_absence_segment(self, point_name: str, frame_index: int) -> bool:
         tracked_point = self.points.get(point_name)
@@ -229,6 +266,7 @@ class CustomPointTracker:
         self._provisional_dirty = {}
         self._segment_results = {}
         self._segment_dirty = {}
+        self._segment_pristine = {}
 
     def _invalidate_point_cache(self, point_name: Optional[str] = None) -> None:
         if point_name is None:
@@ -236,6 +274,7 @@ class CustomPointTracker:
             self._provisional_dirty.clear()
             self._segment_results.clear()
             self._segment_dirty.clear()
+            self._segment_pristine.clear()
             for name in self.points:
                 self._mark_all_spans_dirty(name)
             return
@@ -243,15 +282,18 @@ class CustomPointTracker:
         self._provisional_dirty.pop(point_name, None)
         self._segment_results.pop(point_name, None)
         self._segment_dirty.pop(point_name, None)
+        self._segment_pristine.pop(point_name, None)
         self._mark_all_spans_dirty(point_name)
 
     def _invalidate_segment_cache(self, point_name: Optional[str] = None) -> None:
         if point_name is None:
             self._segment_results.clear()
             self._segment_dirty.clear()
+            self._segment_pristine.clear()
             return
         self._segment_results.pop(point_name, None)
         self._segment_dirty.pop(point_name, None)
+        self._segment_pristine.pop(point_name, None)
 
     def _rejections_for(self, point_name: str, span: Tuple[int, int]) -> Set[int]:
         point_map = self._provisional_rejections.setdefault(point_name, {})
@@ -266,6 +308,9 @@ class CustomPointTracker:
         cache = self._provisional_cache.get(point_name)
         if cache is not None:
             cache.pop(span, None)
+        pristine = self._segment_pristine.get(point_name)
+        if pristine is not None:
+            pristine.pop(span, None)
 
     def _mark_all_spans_dirty(self, point_name: str) -> None:
         tracked_point = self.points.get(point_name)
@@ -278,11 +323,13 @@ class CustomPointTracker:
         provisional_dirty = self._provisional_dirty.setdefault(point_name, set())
         cache = self._provisional_cache.setdefault(point_name, {})
         results = self._segment_results.setdefault(point_name, {})
+        pristine = self._segment_pristine.setdefault(point_name, {})
         for span in spans:
             segment_dirty.add(span)
             provisional_dirty.add(span)
             cache.pop(span, None)
             results.pop(span, None)
+            pristine.pop(span, None)
 
     def _segment_result(
         self, point_name: str, span: Tuple[int, int], tracked_point: TrackedPoint
@@ -291,6 +338,18 @@ class CustomPointTracker:
             return None
         result_map = self._segment_results.get(point_name, {})
         return result_map.get(span)
+
+    def _segment_is_pristine(self, result: SegmentBuildResult) -> bool:
+        chain = result.chain
+        if chain.total_provisionals() > 0:
+            return False
+        max_anchor_residual = max((anchor.residual for anchor in chain.anchors), default=0.0)
+        max_tail_residual = max(
+            (tail.max_residual() for tail in chain.tails.values()),
+            default=0.0,
+        )
+        max_residual = max(max_anchor_residual, max_tail_residual)
+        return max_residual <= chain.threshold_pixels
 
     def _iter_span_pairs(self, tracked_point: TrackedPoint) -> Iterable[Tuple[int, int]]:
         confirmed = tracked_point.accepted_keyframe_frames()
@@ -373,13 +432,21 @@ class CustomPointTracker:
         if not tracked_point:
             return []
         segments: List[TrackingSegment] = []
+        status_map = self._segment_pristine.get(point_name, {})
         for span in self._iter_span_pairs(tracked_point):
             result = self._segment_result(point_name, span, tracked_point)
             if result:
+                pristine = status_map.get(span)
+                for segment in result.segments:
+                    if segment.point_name is None:
+                        segment.point_name = point_name
+                    if pristine is not None:
+                        segment.difference_free = bool(pristine)
                 segments.extend(result.segments)
             else:
                 fallback = self._build_fallback_segment(point_name, span, tracked_point)
                 if fallback:
+                    fallback.difference_free = bool(status_map.get(span, False))
                     segments.append(fallback)
         segments.sort(key=lambda segment: (segment.start_key.frame, segment.end_key.frame, segment.point_name or ""))
         return segments
@@ -487,6 +554,7 @@ class CustomPointTracker:
             span,
             len(result.optical_flow.positions),
         )
+        is_pristine = self._segment_is_pristine(result)
         for frame_index, position in result.optical_flow.positions.items():
             if frame_index in tracked_point.keyframes:
                 continue
@@ -496,6 +564,10 @@ class CustomPointTracker:
 
         for segment in result.segments:
             segment.point_name = point_name
+            segment.difference_free = is_pristine
+
+        status_map = self._segment_pristine.setdefault(point_name, {})
+        status_map[span] = is_pristine
 
         cache = self._provisional_cache.setdefault(point_name, {})
         cache[span] = result.chain
@@ -797,6 +869,7 @@ class CustomPointTracker:
         
 
     def update_from_settings(self, settings: TrackingSettings) -> None:
+        self.tracking_enabled = bool(getattr(settings, "tracking_enabled", True))
         self.max_history_frames = max(1, int(settings.history_frames))
         self.truncate_future_on_manual_set = bool(settings.truncate_future_on_manual_set)
         self.interpolation_mode = settings.baseline_mode.lower()

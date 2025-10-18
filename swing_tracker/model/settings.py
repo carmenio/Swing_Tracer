@@ -18,6 +18,7 @@ class GeneralSettings:
 
 @dataclass
 class TrackingSettings:
+    tracking_enabled: bool = True
     smoothing_enabled: bool = True
     smoothing_alpha: float = 0.2
     max_auto_track_frames: int = 30
