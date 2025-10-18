@@ -35,6 +35,7 @@ class TrackedPoint:
     last_frame_index: Optional[int] = None
     absent_ranges: List[Tuple[int, int]] = field(default_factory=list)
     open_absence_start: Optional[int] = None
+    occluded: bool = False
 
     def record(
         self,
@@ -100,6 +101,7 @@ class TrackedPoint:
         self.last_frame_index = None
         self.absent_ranges.clear()
         self.open_absence_start = None
+        self.occluded = False
 
     def set_keyframe(self, frame_index: int, position: Point2D, *, accepted: bool = False) -> None:
         self.keyframes[frame_index] = position

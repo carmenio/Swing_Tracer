@@ -78,6 +78,8 @@ class InputSettings:
     gesture_sensitivity: float = 1.0
     pan_speed: float = 1.0
     scroll_inertia: float = 0.9
+    auto_jump_enabled: bool = False
+    auto_jump_frames: int = 2
 
 
 @dataclass

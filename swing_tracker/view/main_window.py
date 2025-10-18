@@ -774,7 +774,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             row_layout.addWidget(name_label, stretch=1)
 
             status_label = QtWidgets.QLabel("Not Set")
-            status_label.setFixedWidth(56)
+            status_label.setFixedWidth(70)
             status_label.setAlignment(QtCore.Qt.AlignCenter)
             status_label.setStyleSheet(
                 """
@@ -822,6 +822,13 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self.mark_stop_button.setStyleSheet("")
         self.mark_stop_button.setEnabled(False)
         layout.addWidget(self.mark_stop_button)
+
+        self.toggle_occluded_button = QtWidgets.QPushButton("Mark Occluded")
+        self.toggle_occluded_button.setCursor(QtCore.Qt.PointingHandCursor)
+        self.toggle_occluded_button.setStyleSheet("")
+        self.toggle_occluded_button.setEnabled(False)
+        self.toggle_occluded_button.clicked.connect(self._toggle_point_occluded)
+        layout.addWidget(self.toggle_occluded_button)
 
         return card
 
@@ -1525,6 +1532,8 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
     def _draw_custom_traces(self, painter: QtGui.QPainter) -> None:
         current_index = self.video_player.current_frame_index if self.video_player.is_loaded() else None
         for tracked_point in self.custom_tracker.point_definitions().values():
+            if tracked_point.occluded:
+                continue
             history = tracked_point.history()
             trail_length = self.trail_length
             if current_index is not None:
@@ -1563,7 +1572,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
     def _draw_custom_points(self, painter: QtGui.QPainter) -> None:
         for name, position in self.custom_tracker.current_positions.items():
             tracked_point = self.custom_tracker.point_definitions().get(name)
-            if not tracked_point:
+            if not tracked_point or tracked_point.occluded:
                 continue
             color = QtGui.QColor(*tracked_point.color)
             painter.setPen(QtGui.QPen(color, 2))
@@ -1578,6 +1587,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         for name, widgets in self.point_rows.items():
             tracked_point = self.custom_tracker.point_definitions().get(name)
             current_frame = frame_index
+            occluded = bool(tracked_point and tracked_point.occluded)
             absent = bool(
                 tracked_point and current_frame is not None and tracked_point.is_absent(current_frame)
             )
@@ -1586,9 +1596,23 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
                 and current_frame is not None
                 and current_frame in tracked_point.positions
                 and not absent
+                and not occluded
             )
             status_label: QtWidgets.QLabel = widgets["status"]  # type: ignore[assignment]
-            if absent:
+            if occluded:
+                status_label.setText("Occluded")
+                status_label.setStyleSheet(
+                    """
+                    QLabel {
+                        font-size: 11px;
+                        border-radius: 10px;
+                        padding: 2px 6px;
+                        background-color: rgba(120, 150, 255, 0.28);
+                        color: #dce0ff;
+                    }
+                    """
+                )
+            elif absent:
                 status_label.setText("Off Frame")
                 status_label.setStyleSheet(
                     """
@@ -1688,6 +1712,8 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             """
         )
 
+        self._update_occluded_button_state()
+
         if not self.video_player.is_loaded() or self.active_point is None:
             self.mark_stop_button.setEnabled(False)
             self.mark_stop_button.setText("Mark Off-Frame")
@@ -1696,6 +1722,12 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
 
         tracked_point = self.custom_tracker.point_definitions().get(self.active_point)
         if not tracked_point:
+            self.mark_stop_button.setEnabled(False)
+            self.mark_stop_button.setText("Mark Off-Frame")
+            self.mark_stop_button.setStyleSheet(off_style)
+            return
+
+        if tracked_point.occluded:
             self.mark_stop_button.setEnabled(False)
             self.mark_stop_button.setText("Mark Off-Frame")
             self.mark_stop_button.setStyleSheet(off_style)
@@ -2147,6 +2179,19 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._render_current_frame()
         self._update_timeline_position()
         self._mark_autosave_dirty()
+        self._apply_auto_jump()
+
+    def _apply_auto_jump(self) -> None:
+        if not self.video_player.is_loaded():
+            return
+        input_settings = getattr(self.settings, "input", None)
+        if not input_settings or not getattr(input_settings, "auto_jump_enabled", False):
+            return
+        frames_to_jump = int(getattr(input_settings, "auto_jump_frames", 0))
+        if frames_to_jump <= 0:
+            return
+        target_frame = self.video_player.current_frame_index + frames_to_jump
+        self.seek_to_frame(target_frame, resume_playback=False)
 
     def _clear_selected_point_history(self) -> None:
         if self.active_point is None:
@@ -2200,6 +2245,75 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         if self.current_frame_bgr is not None:
             self._render_current_frame()
         self._mark_autosave_dirty()
+
+    def _toggle_point_occluded(self) -> None:
+        if self.active_point is None:
+            return
+        tracked_point = self.custom_tracker.point_definitions().get(self.active_point)
+        if not tracked_point:
+            return
+        new_value = not tracked_point.occluded
+        if not self.custom_tracker.set_point_occluded(self.active_point, new_value):
+            return
+        self._log.debug("UI: toggle_occluded point=%s value=%s", self.active_point, new_value)
+        self._refresh_point_statuses()
+        if self.current_frame_bgr is not None:
+            self._render_current_frame()
+        self._refresh_issue_panel()
+        self._mark_autosave_dirty()
+
+    def _update_occluded_button_state(self) -> None:
+        button = getattr(self, "toggle_occluded_button", None)
+        if button is None:
+            return
+        default_style = (
+            """
+            QPushButton {
+                background-color: rgba(255, 255, 255, 0.08);
+                border: 1px solid #2f2f2f;
+                border-radius: 12px;
+                font-size: 11px;
+                padding: 6px 10px;
+                color: #f0f0f0;
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 255, 255, 0.18);
+            }
+            """
+        )
+        active_style = (
+            """
+            QPushButton {
+                background-color: rgba(120, 150, 255, 0.24);
+                border: 1px solid rgba(120, 150, 255, 0.6);
+                border-radius: 12px;
+                font-size: 11px;
+                padding: 6px 10px;
+                color: #dce0ff;
+            }
+            QPushButton:hover {
+                background-color: rgba(120, 150, 255, 0.34);
+            }
+            """
+        )
+        if not self.video_player.is_loaded() or self.active_point is None:
+            button.setEnabled(False)
+            button.setText("Mark Occluded")
+            button.setStyleSheet(default_style)
+            return
+        tracked_point = self.custom_tracker.point_definitions().get(self.active_point)
+        if not tracked_point:
+            button.setEnabled(False)
+            button.setText("Mark Occluded")
+            button.setStyleSheet(default_style)
+            return
+        button.setEnabled(True)
+        if tracked_point.occluded:
+            button.setText("Clear Occluded")
+            button.setStyleSheet(active_style)
+        else:
+            button.setText("Mark Occluded")
+            button.setStyleSheet(default_style)
 
     def _jump_to_issue(self, frame_index: int) -> None:
         point = self._active_issue_point or (self.active_point or "")

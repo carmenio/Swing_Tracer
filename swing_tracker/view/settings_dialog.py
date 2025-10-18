@@ -401,6 +401,24 @@ class SettingsDialog(QtWidgets.QDialog):
                                           value_label_name="input_inertia_value",
                                           formatter=lambda v: f"{v / 100:.2f}"))
 
+        auto_jump_group = QtWidgets.QGroupBox("Auto Jump")
+        auto_jump_layout = QtWidgets.QVBoxLayout(auto_jump_group)
+        auto_jump_layout.setSpacing(8)
+        self.input_auto_jump_checkbox = QtWidgets.QCheckBox("Enable Auto Jump After Placement")
+        auto_jump_layout.addWidget(self.input_auto_jump_checkbox)
+        jump_row = QtWidgets.QHBoxLayout()
+        jump_row.addWidget(QtWidgets.QLabel("Frames to Jump"))
+        jump_row.addStretch(1)
+        self.input_auto_jump_frames = QtWidgets.QSpinBox()
+        self.input_auto_jump_frames.setRange(1, 240)
+        self.input_auto_jump_frames.setValue(2)
+        self.input_auto_jump_frames.setSuffix(" frames")
+        jump_row.addWidget(self.input_auto_jump_frames)
+        auto_jump_layout.addLayout(jump_row)
+        layout.addWidget(auto_jump_group)
+        self.input_auto_jump_checkbox.toggled.connect(self.input_auto_jump_frames.setEnabled)
+        self.input_auto_jump_frames.setEnabled(self.input_auto_jump_checkbox.isChecked())
+
         layout.addStretch(1)
         return widget
 
@@ -649,6 +667,10 @@ class SettingsDialog(QtWidgets.QDialog):
         self.input_pan_value.setText(f"{ip.pan_speed:.2f}")
         self.input_inertia_slider.setValue(int(ip.scroll_inertia * 100))
         self.input_inertia_value.setText(f"{ip.scroll_inertia:.2f}")
+        self.input_auto_jump_checkbox.setChecked(ip.auto_jump_enabled)
+        frames_value = int(ip.auto_jump_frames) if ip.auto_jump_frames > 0 else 1
+        self.input_auto_jump_frames.setValue(max(1, frames_value))
+        self.input_auto_jump_frames.setEnabled(ip.auto_jump_enabled)
 
         nt = self.settings.notify
         self.notify_issue_notifications.setChecked(nt.issue_notifications)
@@ -730,6 +752,8 @@ class SettingsDialog(QtWidgets.QDialog):
         ip.gesture_sensitivity = self.input_gesture_slider.value() / 100.0
         ip.pan_speed = self.input_pan_slider.value() / 100.0
         ip.scroll_inertia = self.input_inertia_slider.value() / 100.0
+        ip.auto_jump_enabled = self.input_auto_jump_checkbox.isChecked()
+        ip.auto_jump_frames = max(1, self.input_auto_jump_frames.value())
 
         nt = self.settings.notify
         nt.issue_notifications = self.notify_issue_notifications.isChecked()
