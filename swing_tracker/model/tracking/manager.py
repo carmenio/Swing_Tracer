@@ -1,7 +1,8 @@
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Set, Tuple
+from dataclasses import dataclass, replace
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from PyQt5 import QtCore
 
@@ -32,13 +33,34 @@ class TrackingJobConfig:
     entity_colour: Optional[str]
     frame_loader: Optional[Callable[[int], Optional[object]]]
     preload_weight: float = 0.25
+    lk_window_size: Tuple[int, int] = (21, 21)
+    lk_max_level: int = 3
+    lk_term_count: int = 30
+    lk_term_epsilon: float = 0.01
+    lk_min_eig_threshold: float = 1e-4
+    feature_quality_threshold: float = 0.4
+    min_track_distance: float = 0.0
+    batch_size: int = 8
+    performance_mode: str = "Balanced"
+    thread_priority: str = "Normal"
+    cache_enabled: bool = True
+
+
+@dataclass
+class TrackingJobState:
+    job_id: int
+    point_name: str
+    span: Tuple[int, int]
+    progress: float = 0.0
+    status: str = "Pending"
+    message: str = ""
 
 
 @dataclass
 class ActiveJob:
     config: TrackingJobConfig
     worker: "TrackingWorker"
-    progress: float = 0.0
+    state: TrackingJobState
 
 
 class TrackingWorker(QtCore.QThread):
@@ -46,19 +68,25 @@ class TrackingWorker(QtCore.QThread):
     result_signal = QtCore.pyqtSignal(int, object)
     failed_signal = QtCore.pyqtSignal(int, str)
 
-    def __init__(self, config: TrackingJobConfig, parent: Optional[QtCore.QObject] = None) -> None:
+    def __init__(
+        self,
+        config: TrackingJobConfig,
+        tracker: CustomPointTracker,
+        parent: Optional[QtCore.QObject] = None,
+    ) -> None:
         super().__init__(parent)
         self._config = config
+        self._tracker = tracker
 
     def run(self) -> None:  # pragma: no cover - runs in background thread
-        loader = self._config.frame_loader
-        if loader is None:
-            self.failed_signal.emit(self._config.job_id, "No frame loader configured for tracking.")
-            return
-
         span_start, span_end = self._config.span
         if span_end <= span_start:
             self.failed_signal.emit(self._config.job_id, "Invalid tracking span.")
+            return
+
+        loader = self._config.frame_loader or self._tracker.get_frame_loader()
+        if loader is None:
+            self.failed_signal.emit(self._config.job_id, "No frame loader configured for tracking.")
             return
 
         frames: Dict[int, FrameSample] = {}
@@ -70,14 +98,21 @@ class TrackingWorker(QtCore.QThread):
             for index, frame_index in enumerate(range(span_start, span_end + 1)):
                 if self.isInterruptionRequested():
                     return
-                frame_bgr = loader(frame_index)
-                if frame_bgr is None:
-                    self.failed_signal.emit(
-                        self._config.job_id,
-                        f"Unable to load frame {frame_index} for tracking.",
-                    )
-                    return
-                frames[frame_index] = FrameSample(frame_bgr)
+                sample = self._tracker.ensure_frame_sample(frame_index)
+                if sample is None:
+                    frame_bgr = loader(frame_index)
+                    if frame_bgr is None:
+                        self.failed_signal.emit(
+                            self._config.job_id,
+                            f"Unable to load frame {frame_index} for tracking.",
+                        )
+                        return
+                    sample = FrameSample(frame_bgr)
+                    if self._config.cache_enabled:
+                        cached = self._tracker.cache_frame_sample(frame_index, frame_bgr)
+                        if cached is not None:
+                            sample = cached
+                frames[frame_index] = sample
                 if preload_weight > 0.0:
                     preload_progress = preload_weight * ((index + 1) / (total_frames + 1))
                     self.progress_signal.emit(self._config.job_id, preload_progress)
@@ -94,6 +129,14 @@ class TrackingWorker(QtCore.QThread):
                 min_improvement_ratio=self._config.min_improvement_ratio,
                 smoothing_window=self._config.smoothing_window,
                 entity_colour=self._config.entity_colour,
+                lk_window_size=self._config.lk_window_size,
+                lk_max_level=self._config.lk_max_level,
+                lk_term_count=self._config.lk_term_count,
+                lk_term_epsilon=self._config.lk_term_epsilon,
+                lk_min_eig_threshold=self._config.lk_min_eig_threshold,
+                feature_quality_threshold=self._config.feature_quality_threshold,
+                min_track_distance=self._config.min_track_distance,
+                batch_size=self._config.batch_size,
             )
 
             def on_progress(fraction: float) -> None:
@@ -133,11 +176,16 @@ class TrackingManager(QtCore.QObject):
     tracking_finished = QtCore.pyqtSignal()
     segment_ready = QtCore.pyqtSignal(str, tuple)
     segment_failed = QtCore.pyqtSignal(str, tuple, str)
+    job_registered = QtCore.pyqtSignal(object)
+    job_updated = QtCore.pyqtSignal(object)
+    job_removed = QtCore.pyqtSignal(int)
 
     def __init__(self, tracker: CustomPointTracker, parent: Optional[QtCore.QObject] = None) -> None:
         super().__init__(parent)
         self._tracker = tracker
         self._jobs: Dict[int, ActiveJob] = {}
+        self._job_states: Dict[int, TrackingJobState] = {}
+        self._paused_jobs: Dict[int, TrackingJobConfig] = {}
         self._span_to_job: Dict[Tuple[str, Tuple[int, int]], int] = {}
         self._next_job_id: int = 1
         self._shutting_down: bool = False
@@ -148,12 +196,13 @@ class TrackingManager(QtCore.QObject):
         spans = self._tracker.span_pairs(point_name)
         if not spans:
             return
-
         for span in spans:
             if not self._tracker.requires_tracking(point_name, span):
                 continue
             key = (point_name, span)
             if key in self._span_to_job:
+                continue
+            if any(cfg.point_name == point_name and cfg.span == span for cfg in self._paused_jobs.values()):
                 continue
             job_id = self._next_job_id
             config = self._build_job_config(job_id, point_name, span)
@@ -167,21 +216,75 @@ class TrackingManager(QtCore.QObject):
             self.request_point(point_name)
 
     def reset(self) -> None:
-        was_active = bool(self._jobs)
+        running = list(self._jobs.values())
         self._shutting_down = True
-        for job in list(self._jobs.values()):
+        for job in running:
             job.worker.requestInterruption()
-        for job in list(self._jobs.values()):
+        for job in running:
             job.worker.wait(1000)
         self._jobs.clear()
         self._span_to_job.clear()
+        self._paused_jobs.clear()
+        removed_ids = list(self._job_states.keys())
+        self._job_states.clear()
+        for job_id in removed_ids:
+            self.job_removed.emit(job_id)
+        self._next_job_id = 1
         self._shutting_down = False
         self.overall_progress.emit(0.0)
-        if was_active:
+        if running:
             self.tracking_finished.emit()
 
     def shutdown(self) -> None:
         self.reset()
+
+    def pause_job(self, job_id: int) -> bool:
+        job = self._jobs.get(job_id)
+        if not job:
+            return False
+        job.worker.requestInterruption()
+        job.worker.wait(1000)
+        self._jobs.pop(job_id, None)
+        self._span_to_job.pop((job.config.point_name, job.config.span), None)
+        self._paused_jobs[job_id] = job.config
+        job.state.status = "Paused"
+        self.job_updated.emit(replace(job.state))
+        self._emit_overall_progress()
+        return True
+
+    def resume_job(self, job_id: int) -> bool:
+        config = self._paused_jobs.pop(job_id, None)
+        if config is None:
+            return False
+        state = self._job_states.get(job_id)
+        if state is not None:
+            state.progress = 0.0
+            state.message = ""
+        self._start_job(config)
+        return True
+
+    def cancel_job(self, job_id: int) -> bool:
+        config = self._paused_jobs.pop(job_id, None)
+        job = self._jobs.pop(job_id, None)
+        if job is None and config is None:
+            return False
+        if job is not None:
+            job.worker.requestInterruption()
+            job.worker.wait(1000)
+            self._span_to_job.pop((job.config.point_name, job.config.span), None)
+            state = job.state
+        else:
+            state = self._job_states.get(job_id)
+        if state is not None:
+            state.status = "Cancelled"
+            state.progress = 0.0
+            state.message = ""
+            self.job_updated.emit(replace(state))
+        self._emit_overall_progress()
+        return True
+
+    def job_states(self) -> Dict[int, TrackingJobState]:
+        return {job_id: replace(state) for job_id, state in self._job_states.items()}
 
     def _build_job_config(
         self,
@@ -192,18 +295,22 @@ class TrackingManager(QtCore.QObject):
         tracked_point = self._tracker.point_definitions().get(point_name)
         if not tracked_point:
             return None
-
         start_frame, end_frame = span
         start_pos = tracked_point.keyframes.get(start_frame)
         end_pos = tracked_point.keyframes.get(end_frame)
         if start_pos is None or end_pos is None:
             return None
-
         loader = self._tracker.get_frame_loader()
         if loader is None:
             return None
-
-        config = TrackingJobConfig(
+        window = int(self._tracker.lk_window_size)
+        if window % 2 == 0:
+            window += 1
+        performance = (self._tracker.performance_mode or "Balanced").lower()
+        preload = 0.18 if performance == "high" else 0.25
+        if not self._tracker.cache_frames_enabled:
+            preload = min(preload, 0.2)
+        return TrackingJobConfig(
             job_id=job_id,
             point_name=point_name,
             span=span,
@@ -223,12 +330,32 @@ class TrackingManager(QtCore.QObject):
             smoothing_window=self._tracker.smoothing_window,
             entity_colour=self._tracker.point_colour_hex(point_name),
             frame_loader=loader,
+            preload_weight=preload,
+            lk_window_size=(window, window),
+            lk_max_level=self._tracker.lk_max_level,
+            lk_term_count=self._tracker.lk_term_count,
+            lk_term_epsilon=self._tracker.lk_term_epsilon,
+            lk_min_eig_threshold=self._tracker.lk_min_eig_threshold,
+            feature_quality_threshold=self._tracker.lk_feature_quality,
+            min_track_distance=self._tracker.lk_min_distance,
+            batch_size=self._tracker.lk_batch_size,
+            performance_mode=self._tracker.performance_mode,
+            thread_priority=self._tracker.thread_priority,
+            cache_enabled=self._tracker.cache_frames_enabled,
         )
-        return config
 
     def _start_job(self, config: TrackingJobConfig) -> None:
-        worker = TrackingWorker(config)
-        job = ActiveJob(config=config, worker=worker)
+        state = self._job_states.get(config.job_id)
+        is_new = state is None
+        if state is None:
+            state = TrackingJobState(job_id=config.job_id, point_name=config.point_name, span=config.span)
+        state.progress = 0.0
+        state.status = "Running"
+        state.message = ""
+        self._job_states[config.job_id] = state
+
+        worker = TrackingWorker(config, self._tracker)
+        job = ActiveJob(config=config, worker=worker, state=state)
         self._jobs[config.job_id] = job
         self._span_to_job[(config.point_name, config.span)] = config.job_id
 
@@ -242,13 +369,34 @@ class TrackingManager(QtCore.QObject):
             self.overall_progress.emit(0.0)
 
         worker.start()
+        priority = self._priority_value(config)
+        if priority is not None:
+            worker.setPriority(priority)
+        (self.job_registered if is_new else self.job_updated).emit(replace(state))
+
+    def _priority_value(self, config: TrackingJobConfig) -> Optional[QtCore.QThread.Priority]:
+        mode = (config.performance_mode or "").lower()
+        if mode == "high":
+            return QtCore.QThread.HighestPriority
+        mapping = {
+            "lowest": QtCore.QThread.LowestPriority,
+            "low": QtCore.QThread.LowPriority,
+            "normal": QtCore.QThread.NormalPriority,
+            "high": QtCore.QThread.HighPriority,
+            "timecritical": QtCore.QThread.TimeCriticalPriority,
+        }
+        key = (config.thread_priority or "Normal").replace(" ", "").lower()
+        return mapping.get(key, QtCore.QThread.NormalPriority)
 
     @QtCore.pyqtSlot(int, float)
     def _on_worker_progress(self, job_id: int, progress: float) -> None:
         job = self._jobs.get(job_id)
         if not job:
             return
-        job.progress = max(0.0, min(1.0, progress))
+        job.state.progress = max(0.0, min(1.0, progress))
+        if job.state.status != "Running":
+            job.state.status = "Running"
+        self.job_updated.emit(replace(job.state))
         self._emit_overall_progress()
 
     @QtCore.pyqtSlot(int, object)
@@ -258,37 +406,49 @@ class TrackingManager(QtCore.QObject):
         job = self._jobs.get(job_id)
         if not job:
             return
-        result: Optional[SegmentBuildResult] = None
-        if isinstance(payload, SegmentBuildResult):
-            result = payload
-        self._tracker.apply_segment_result(job.config.point_name, job.config.span, result)
-        self._finalise_job(job_id, success=result is not None, message=None)
+        result: Optional[SegmentBuildResult] = payload if isinstance(payload, SegmentBuildResult) else None
+        if result is not None:
+            self._tracker.apply_segment_result(job.config.point_name, job.config.span, result)
+            self.segment_ready.emit(job.config.point_name, job.config.span)
+            self._finalise_job(job_id, status="Completed", progress=1.0)
+        else:
+            self.segment_failed.emit(job.config.point_name, job.config.span, "Tracking produced no result.")
+            self._finalise_job(job_id, status="Failed")
 
     @QtCore.pyqtSlot(int, str)
     def _on_worker_failed(self, job_id: int, message: str) -> None:
         if self._shutting_down:
             return
-        self._finalise_job(job_id, success=False, message=message)
+        state = self._job_states.get(job_id)
+        if state is not None:
+            self.segment_failed.emit(state.point_name, state.span, message)
+        self._finalise_job(job_id, status="Failed", message=message)
 
-    def _finalise_job(self, job_id: int, *, success: bool, message: Optional[str]) -> None:
+    def _finalise_job(self, job_id: int, *, status: str, message: Optional[str] = None, progress: Optional[float] = None) -> None:
         job = self._jobs.pop(job_id, None)
-        if not job:
+        if job is not None:
+            self._span_to_job.pop((job.config.point_name, job.config.span), None)
+        state = self._job_states.get(job_id)
+        if state is None:
             return
-        self._span_to_job.pop((job.config.point_name, job.config.span), None)
-
-        if success:
-            self.segment_ready.emit(job.config.point_name, job.config.span)
-        else:
-            self.segment_failed.emit(job.config.point_name, job.config.span, message or "Tracking failed.")
-
-        if self._jobs:
-            self._emit_overall_progress()
-        else:
-            self.overall_progress.emit(1.0 if success else 0.0)
+        if progress is not None:
+            state.progress = max(0.0, min(1.0, progress))
+        state.status = status
+        state.message = message or ""
+        self.job_updated.emit(replace(state))
+        self._emit_overall_progress()
+        if not self._jobs and not self._shutting_down:
             self.tracking_finished.emit()
 
     def _emit_overall_progress(self) -> None:
-        if not self._jobs:
+        if self._jobs:
+            average = sum(job.state.progress for job in self._jobs.values()) / len(self._jobs)
+            self.overall_progress.emit(max(0.0, min(1.0, average)))
             return
-        average = sum(job.progress for job in self._jobs.values()) / len(self._jobs)
-        self.overall_progress.emit(max(0.0, min(1.0, average)))
+        if not self._job_states:
+            self.overall_progress.emit(0.0)
+            return
+        if all(state.status == "Completed" for state in self._job_states.values()):
+            self.overall_progress.emit(1.0)
+        else:
+            self.overall_progress.emit(0.0)

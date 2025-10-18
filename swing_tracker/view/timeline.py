@@ -17,6 +17,7 @@ class TimelineMarker:
     frame: int
     color: QtGui.QColor
     category: str = "manual"
+    point_name: Optional[str] = None
 
 
 def marker_line_color(marker: TimelineMarker) -> QtGui.QColor:
@@ -40,6 +41,7 @@ def marker_line_color(marker: TimelineMarker) -> QtGui.QColor:
 
 class DetailedTimeline(QtWidgets.QWidget):
     seekRequested = QtCore.pyqtSignal(int)
+    markerSelected = QtCore.pyqtSignal(str, int, str)
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -54,9 +56,9 @@ class DetailedTimeline(QtWidgets.QWidget):
         self.absence_ranges: List[Tuple[int, int]] = []
         self.frame_map: List[int] = []
         self._marker_frames: List[int] = []
-        self._hit_regions: List[Tuple[int, QtCore.QPointF, float]] = []
+        self._hit_regions: List[Tuple[int, Optional[str], QtCore.QPointF, float]] = []
         self.segments: List[TrackingSegment] = []
-        self._segment_lookup: Dict[Tuple[int, int], TrackingSegment] = {}
+        self._segment_lookup: Dict[Tuple[int, int], List[TrackingSegment]] = {}
 
         self._dragging: bool = False
         self._highlight_frame: Optional[int] = None
@@ -66,6 +68,7 @@ class DetailedTimeline(QtWidgets.QWidget):
         self._highlight_anim.setEasingCurve(QtCore.QEasingCurve.OutQuad)
         self._highlight_anim.valueChanged.connect(self._on_highlight_value_changed)
         self._highlight_anim.finished.connect(self._on_highlight_finished)
+        self._selected_marker: Optional[Tuple[str, int]] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -94,7 +97,12 @@ class DetailedTimeline(QtWidgets.QWidget):
         for marker in markers:
             if isinstance(marker, TimelineMarker):
                 parsed.append(
-                    TimelineMarker(int(marker.frame), QtGui.QColor(marker.color), marker.category)
+                    TimelineMarker(
+                        int(marker.frame),
+                        QtGui.QColor(marker.color),
+                        marker.category,
+                        getattr(marker, "point_name", None),
+                    )
                 )
                 continue
             if isinstance(marker, tuple) and len(marker) >= 2:
@@ -102,14 +110,15 @@ class DetailedTimeline(QtWidgets.QWidget):
                 color_value = marker[1]
                 color = QtGui.QColor(color_value) if not isinstance(color_value, QtGui.QColor) else color_value
                 category = marker[2] if len(marker) >= 3 else "manual"
-                parsed.append(TimelineMarker(frame, QtGui.QColor(color), str(category)))
+                point_name = marker[3] if len(marker) >= 4 else None
+                parsed.append(TimelineMarker(frame, QtGui.QColor(color), str(category), point_name))
                 continue
             try:
                 frame = int(marker)  # type: ignore[arg-type]
             except (TypeError, ValueError):
                 continue
-            parsed.append(TimelineMarker(frame, QtGui.QColor("#32ff8a"), "manual"))
-        parsed = [TimelineMarker(max(0, item.frame), item.color, item.category) for item in parsed]
+            parsed.append(TimelineMarker(frame, QtGui.QColor("#32ff8a"), "manual", None))
+        parsed = [TimelineMarker(max(0, item.frame), item.color, item.category, item.point_name) for item in parsed]
         parsed.sort(key=lambda item: item.frame)
         if self.markers != parsed:
             self.markers = parsed
@@ -136,13 +145,28 @@ class DetailedTimeline(QtWidgets.QWidget):
 
     def set_segments(self, segments: Iterable[TrackingSegment]) -> None:
         parsed: List[TrackingSegment] = [segment for segment in segments]
-        parsed.sort(key=lambda segment: (segment.start_key.frame, segment.end_key.frame))
+        parsed.sort(key=lambda segment: (segment.start_key.frame, segment.end_key.frame, segment.point_name or ""))
         if self.segments != parsed:
             self.segments = parsed
-            self._segment_lookup = {
-                (segment.start_key.frame, segment.end_key.frame): segment for segment in parsed
-            }
+            mapping: Dict[Tuple[int, int], List[TrackingSegment]] = {}
+            for segment in parsed:
+                key = (segment.start_key.frame, segment.end_key.frame)
+                mapping.setdefault(key, []).append(segment)
+            for bucket in mapping.values():
+                bucket.sort(key=lambda seg: seg.point_name or "")
+            self._segment_lookup = mapping
             self.update()
+
+    def set_selected_marker(self, point_name: Optional[str], frame: Optional[int]) -> None:
+        key: Optional[Tuple[str, int]] = None
+        if point_name is not None and frame is not None:
+            key = (point_name or "", int(frame))
+        if self._selected_marker != key:
+            self._selected_marker = key
+            self.update()
+
+    def selected_marker(self) -> Optional[Tuple[str, int]]:
+        return self._selected_marker
 
     def pulse_highlight(self, frame_index: int) -> None:
         frame_index = max(0, int(frame_index))
@@ -224,14 +248,14 @@ class DetailedTimeline(QtWidgets.QWidget):
                 end_x = content.left() + end_percent * content.width()
                 if end_x <= start_x:
                     continue
-                segment = self._segment_lookup.get((marker.frame, next_marker.frame))
+                segments_between = self._segment_lookup.get((marker.frame, next_marker.frame), [])
                 start_point = QtCore.QPointF(start_x, center_y)
                 end_point = QtCore.QPointF(end_x, center_y)
-                if segment:
-                    self._draw_segment_line(painter, segment, start_point, end_point)
+                if segments_between:
+                    self._draw_segment_lines(painter, segments_between, start_point, end_point)
                 else:
                     line_color = marker_line_color(marker)
-                    painter.setPen(QtGui.QPen(line_color, 3, cap=QtCore.Qt.RoundCap))
+                    painter.setPen(QtGui.QPen(line_color, 2, cap=QtCore.Qt.RoundCap))
                     painter.drawLine(start_point, end_point)
 
             # Draw individual markers
@@ -241,19 +265,35 @@ class DetailedTimeline(QtWidgets.QWidget):
                 percent = (marker_pos - start_index) / span
                 x = content.left() + percent * content.width()
                 point_color = QtGui.QColor(marker.color)
-                radius = 5.0 if marker.category == "manual" else 4.0
+                base_radius = 3.2
+                if marker.category == "auto":
+                    base_radius = 2.6
+                elif marker.category == "provisional":
+                    base_radius = 3.0
+                elif marker.category in {"start", "stop"}:
+                    base_radius = 3.6
+
+                marker_key = (marker.point_name or "", marker.frame)
+                selected = self._selected_marker == marker_key
+                fill_marker = marker.category not in {"provisional", "start", "stop"}
+                outline_color = QtGui.QColor("#101010")
+                pen_width = 1.0
                 if marker.category == "provisional":
-                    radius = 5.5
-                    painter.setBrush(QtCore.Qt.NoBrush)
-                    painter.setPen(QtGui.QPen(point_color, 2))
-                else:
-                    painter.setBrush(point_color)
-                    painter.setPen(QtGui.QPen(QtGui.QColor("#050505"), 1))
+                    outline_color = point_color
                 if marker.category in {"start", "stop"}:
-                    radius = 6.0
-                    painter.setPen(QtGui.QPen(QtGui.QColor(255, 80, 80, 180), 2))
-                painter.drawEllipse(QtCore.QPointF(x, center_y), radius, radius)
-                self._hit_regions.append((marker.frame, QtCore.QPointF(x, center_y), radius + 3.0))
+                    outline_color = QtGui.QColor(255, 80, 80, 180)
+                    fill_marker = False
+
+                painter.setBrush(QtGui.QBrush(point_color) if fill_marker else QtCore.Qt.NoBrush)
+                painter.setPen(QtGui.QPen(outline_color, pen_width))
+                painter.drawEllipse(QtCore.QPointF(x, center_y), base_radius, base_radius)
+
+                if selected:
+                    painter.setBrush(QtCore.Qt.NoBrush)
+                    painter.setPen(QtGui.QPen(QtGui.QColor("#f5f5f5"), 1.2))
+                    painter.drawEllipse(QtCore.QPointF(x, center_y), base_radius + 1.6, base_radius + 1.6)
+
+                self._hit_regions.append((marker.frame, marker.point_name, QtCore.QPointF(x, center_y), base_radius + 3.0))
         else:
             self._hit_regions = []
 
@@ -280,43 +320,57 @@ class DetailedTimeline(QtWidgets.QWidget):
             painter.setPen(QtGui.QPen(QtGui.QColor("#ffffff"), 2))
             painter.drawLine(QtCore.QPointF(x, content.top()), QtCore.QPointF(x, content.bottom()))
 
+    def _draw_segment_lines(
+        self,
+        painter: QtGui.QPainter,
+        segments: List[TrackingSegment],
+        start_point: QtCore.QPointF,
+        end_point: QtCore.QPointF,
+    ) -> None:
+        if not segments:
+            return
+        count = len(segments)
+        vertical_step = 3.0 if count > 1 else 0.0
+        for index, segment in enumerate(segments):
+            offset = (index - (count - 1) / 2.0) * vertical_step
+            self._draw_segment_line(painter, segment, start_point, end_point, offset_y=offset)
+
     def _draw_segment_line(
         self,
         painter: QtGui.QPainter,
         segment: TrackingSegment,
         start_point: QtCore.QPointF,
         end_point: QtCore.QPointF,
+        *,
+        offset_y: float = 0.0,
+        line_width: float = 2.0,
     ) -> None:
-        print("run")
-        # if segment.accepted and segment.entity_colour:
-        #     color = QtGui.QColor(segment.entity_colour)
-        #     pen = QtGui.QPen(color, 3, cap=QtCore.Qt.RoundCap)
-        #     painter.setPen(pen)
-        #     painter.drawLine(start_point, end_point)
-        #     return
+        start = QtCore.QPointF(start_point)
+        end = QtCore.QPointF(end_point)
+        if offset_y:
+            start.setY(start.y() + offset_y)
+            end.setY(end.y() + offset_y)
 
         color_stops = segment.color_stops()
-        print("DEBUG: _draw_segment_line: segment frames", segment.start_key.frame, segment.end_key.frame, "color_stops:", color_stops)
         if not color_stops:
-            pen = QtGui.QPen(QtGui.QColor("#00ff00"), 3, cap=QtCore.Qt.RoundCap)
+            pen = QtGui.QPen(QtGui.QColor("#00ff00"), line_width, cap=QtCore.Qt.RoundCap)
             painter.setPen(pen)
-            painter.drawLine(start_point, end_point)
+            painter.drawLine(start, end)
             return
 
-        gradient = QtGui.QLinearGradient(start_point, end_point)
+        gradient = QtGui.QLinearGradient(start, end)
         span = max(1, segment.end_key.frame - segment.start_key.frame)
         for frame, colour in color_stops:
             ratio = (frame - segment.start_key.frame) / span
             ratio = max(0.0, min(1.0, ratio))
-            print("DEBUG: _draw_segment_line: frame", frame, "ratio", ratio, "color", colour)
             gradient.setColorAt(ratio, QtGui.QColor(colour))
 
         pen = QtGui.QPen()
-        pen.setWidth(3)
+        pen.setWidthF(line_width)
         pen.setCapStyle(QtCore.Qt.RoundCap)
         pen.setBrush(QtGui.QBrush(gradient))
         painter.setPen(pen)
-        painter.drawLine(start_point, end_point)
+        painter.drawLine(start, end)
 
     def _on_highlight_value_changed(self, value: object) -> None:
         try:
@@ -335,12 +389,23 @@ class DetailedTimeline(QtWidgets.QWidget):
     # ------------------------------------------------------------------
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.LeftButton:
-            hit_frame = self._marker_hit_test(event.pos())
-            if hit_frame is not None:
+            hit_info = self._marker_hit_test(event.pos())
+            if hit_info is not None:
+                frame, point_name = hit_info
+                marker = self._find_marker(frame, point_name)
+                key = (marker.point_name or "", frame) if marker else ((point_name or ""), frame)
+                if self._selected_marker != key:
+                    self._selected_marker = key
+                    self.update()
+                category = marker.category if marker else "manual"
+                self.markerSelected.emit(key[0], frame, category)
                 self._dragging = False
-                self.seekRequested.emit(hit_frame)
+                self.seekRequested.emit(frame)
                 event.accept()
                 return
+            if self._selected_marker is not None:
+                self._selected_marker = None
+                self.update()
             self._dragging = True
             self._seek_at(event.pos())
             event.accept()
@@ -453,14 +518,22 @@ class DetailedTimeline(QtWidgets.QWidget):
             visible.append((marker, marker_pos))
         return visible
 
-    def _marker_hit_test(self, pos: QtCore.QPoint) -> Optional[int]:
+    def _marker_hit_test(self, pos: QtCore.QPoint) -> Optional[Tuple[int, Optional[str]]]:
         if not self._hit_regions:
             return None
-        for frame, center, radius in self._hit_regions:
+        for frame, point_name, center, radius in self._hit_regions:
             dx = pos.x() - center.x()
             dy = pos.y() - center.y()
             if (dx * dx + dy * dy) <= radius * radius:
-                return frame
+                return (frame, point_name)
+        return None
+
+    def _find_marker(self, frame: int, point_name: Optional[str]) -> Optional[TimelineMarker]:
+        for marker in self.markers:
+            if marker.frame != frame:
+                continue
+            if point_name is None or marker.point_name == point_name:
+                return marker
         return None
 
 
@@ -522,7 +595,12 @@ class OverviewTimeline(QtWidgets.QWidget):
         for marker in markers:
             if isinstance(marker, TimelineMarker):
                 parsed.append(
-                    TimelineMarker(int(marker.frame), QtGui.QColor(marker.color), marker.category)
+                    TimelineMarker(
+                        int(marker.frame),
+                        QtGui.QColor(marker.color),
+                        marker.category,
+                        getattr(marker, "point_name", None),
+                    )
                 )
                 continue
             if isinstance(marker, tuple) and len(marker) >= 2:
@@ -530,14 +608,15 @@ class OverviewTimeline(QtWidgets.QWidget):
                 color_value = marker[1]
                 color = QtGui.QColor(color_value) if not isinstance(color_value, QtGui.QColor) else color_value
                 category = marker[2] if len(marker) >= 3 else "manual"
-                parsed.append(TimelineMarker(frame, QtGui.QColor(color), str(category)))
+                point_name = marker[3] if len(marker) >= 4 else None
+                parsed.append(TimelineMarker(frame, QtGui.QColor(color), str(category), point_name))
                 continue
             try:
                 frame = int(marker)  # type: ignore[arg-type]
             except (TypeError, ValueError):
                 continue
-            parsed.append(TimelineMarker(frame, QtGui.QColor(50, 255, 138, 160), "manual"))
-        parsed = [TimelineMarker(max(0, item.frame), item.color, item.category) for item in parsed]
+            parsed.append(TimelineMarker(frame, QtGui.QColor(50, 255, 138, 160), "manual", None))
+        parsed = [TimelineMarker(max(0, item.frame), item.color, item.category, item.point_name) for item in parsed]
         parsed.sort(key=lambda item: item.frame)
         if self.markers != parsed:
             self.markers = parsed
@@ -563,12 +642,15 @@ class OverviewTimeline(QtWidgets.QWidget):
 
     def set_segments(self, segments: Iterable[TrackingSegment]) -> None:
         parsed: List[TrackingSegment] = [segment for segment in segments]
-        parsed.sort(key=lambda segment: (segment.start_key.frame, segment.end_key.frame))
+        parsed.sort(key=lambda segment: (segment.start_key.frame, segment.end_key.frame, segment.point_name or ""))
         if self.segments != parsed:
             self.segments = parsed
-            self._segment_lookup = {
-                (segment.start_key.frame, segment.end_key.frame): segment for segment in parsed
-            }
+            mapping: Dict[Tuple[int, int], List[TrackingSegment]] = {}
+            for segment in parsed:
+                mapping.setdefault((segment.start_key.frame, segment.end_key.frame), []).append(segment)
+            for bucket in mapping.values():
+                bucket.sort(key=lambda seg: seg.point_name or "")
+            self._segment_lookup = mapping
             self.update()
 
     # ------------------------------------------------------------------

@@ -27,11 +27,19 @@ class TrackingSettings:
     history_frames: int = 300
     optical_flow_window_size: int = 21
     optical_flow_pyramid: int = 3
-    optical_flow_termination: float = 0.03
+    optical_flow_term_count: int = 30
+    optical_flow_term_epsilon: float = 0.01
+    optical_flow_feature_quality: float = 0.4
+    optical_flow_min_distance: float = 1.5
+    optical_flow_min_eig_threshold: float = 1e-4
+    optical_flow_batch_size: int = 8
     issue_confidence_threshold: float = 0.6
     resolved_confidence_threshold: float = 0.8
-    truncate_future_on_manual_set: bool = True
+    truncate_future_on_manual_set: bool = False
     baseline_mode: str = "linear"
+    performance_mode: str = "Balanced"
+    thread_priority: str = "Normal"
+    cache_frames_enabled: bool = True
 
 
 @dataclass

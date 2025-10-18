@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from collections import deque
 from typing import Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
+import threading
 
 import cv2
 
@@ -40,6 +41,17 @@ class CustomPointTracker:
         self.min_improvement_px: float = 2.0
         self.min_improvement_ratio: float = 0.2
         self.smoothing_window: int = 5
+        self.lk_window_size: int = 21
+        self.lk_max_level: int = 3
+        self.lk_term_count: int = 30
+        self.lk_term_epsilon: float = 0.01
+        self.lk_feature_quality: float = 0.4
+        self.lk_min_distance: float = 1.5
+        self.lk_min_eig_threshold: float = 1e-4
+        self.lk_batch_size: int = 8
+        self.performance_mode: str = "Balanced"
+        self.thread_priority: str = "Normal"
+        self.cache_frames_enabled: bool = True
         self._provisional_cache: Dict[str, Dict[Tuple[int, int], ProvisionalChain]] = {}
         self._provisional_rejections: Dict[str, Dict[Tuple[int, int], Set[int]]] = {}
         self._provisional_dirty: Dict[str, Set[Tuple[int, int]]] = {}
@@ -48,6 +60,7 @@ class CustomPointTracker:
         self._segment_results: Dict[str, Dict[Tuple[int, int], SegmentBuildResult]] = {}
         self._segment_dirty: Dict[str, Set[Tuple[int, int]]] = {}
         self._frame_loader: Optional[Callable[[int], Optional[object]]] = None
+        self._frame_lock = threading.RLock()
 
     def configure_points(self, point_definitions: Dict[str, Tuple[int, int, int]]) -> None:
         self.points = {
@@ -56,21 +69,54 @@ class CustomPointTracker:
         }
         self.current_positions.clear()
         self._reset_provisional_state()
-        self._frame_samples.clear()
-        self._frame_order.clear()
+        with self._frame_lock:
+            self._frame_samples.clear()
+            self._frame_order.clear()
 
     def reset(self) -> None:
         for tracked_point in self.points.values():
             tracked_point.clear()
         self.current_positions.clear()
         self._reset_provisional_state()
-        self._frame_samples.clear()
-        self._frame_order.clear()
+        with self._frame_lock:
+            self._frame_samples.clear()
+            self._frame_order.clear()
 
     def set_frame_loader(self, loader: Optional[Callable[[int], Optional[object]]]) -> None:
         """Register a callback that returns a BGR frame for the given index."""
 
         self._frame_loader = loader
+
+    def get_frame_loader(self) -> Optional[Callable[[int], Optional[object]]]:
+        return self._frame_loader
+
+    def ensure_frame_sample(self, frame_index: int) -> Optional[FrameSample]:
+        loader = self._frame_loader
+        if loader is None:
+            return None
+        if self.cache_frames_enabled:
+            with self._frame_lock:
+                cached = self._frame_samples.get(frame_index)
+            if cached is not None:
+                return cached
+        frame_bgr = loader(frame_index)
+        if frame_bgr is None:
+            return None
+        return self._store_frame(frame_index, frame_bgr)
+
+    def fetch_frame_samples(self, span_start: int, span_end: int) -> Dict[int, FrameSample]:
+        frames: Dict[int, FrameSample] = {}
+        if span_end < span_start:
+            return frames
+        for frame_index in range(span_start, span_end + 1):
+            sample = self.ensure_frame_sample(frame_index)
+            if sample is None:
+                return {}
+            frames[frame_index] = sample
+        return frames
+
+    def cache_frame_sample(self, frame_index: int, frame_bgr) -> Optional[FrameSample]:
+        return self._store_frame(frame_index, frame_bgr)
 
     # ------------------------------------------------------------------
     # Provisional refinement helpers
@@ -232,6 +278,13 @@ class CustomPointTracker:
         segments.sort(key=lambda segment: (segment.start_key.frame, segment.end_key.frame))
         return segments
 
+    def all_tracking_segments(self) -> List[TrackingSegment]:
+        segments: List[TrackingSegment] = []
+        for point_name in self.points.keys():
+            segments.extend(self.tracking_segments(point_name))
+        segments.sort(key=lambda segment: (segment.start_key.frame, segment.end_key.frame, segment.point_name or ""))
+        return segments
+
     def span_pairs(self, point_name: str) -> List[Tuple[int, int]]:
         tracked_point = self.points.get(point_name)
         if not tracked_point:
@@ -278,6 +331,9 @@ class CustomPointTracker:
             tracked_point.positions[frame_index] = position
             tracked_point.confidence[frame_index] = result.optical_flow.confidences.get(frame_index, 0.0)
             tracked_point.fb_errors[frame_index] = result.optical_flow.fb_errors.get(frame_index, 0.0)
+
+        for segment in result.segments:
+            segment.point_name = point_name
 
         cache = self._provisional_cache.setdefault(point_name, {})
         cache[span] = result.chain
@@ -546,34 +602,82 @@ class CustomPointTracker:
             tracked_point.interpolation_cache.pop(frame_index, None)
             self._invalidate_point_cache(point_name)
         return removed
+
+    def delete_keyframe(self, point_name: str, frame_index: int) -> bool:
+        tracked_point = self.points.get(point_name)
+        if not tracked_point:
+            return False
+        related_spans = [span for span in self._iter_span_pairs(tracked_point) if span[0] <= frame_index <= span[1]]
+        removed = tracked_point.remove_keyframe(frame_index)
+        if not removed:
+            return False
+        tracked_point.positions.pop(frame_index, None)
+        tracked_point.confidence.pop(frame_index, None)
+        tracked_point.fb_errors.pop(frame_index, None)
+        tracked_point.low_confidence_frames.discard(frame_index)
+        tracked_point.interpolation_cache.pop(frame_index, None)
+        for span in related_spans:
+            self._mark_span_dirty(point_name, span)
+        self._invalidate_point_cache(point_name)
+        return True
         
 
     def update_from_settings(self, settings: TrackingSettings) -> None:
-        self.max_history_frames = settings.history_frames
-        self.truncate_future_on_manual_set = settings.truncate_future_on_manual_set
+        self.max_history_frames = max(1, int(settings.history_frames))
+        self.truncate_future_on_manual_set = bool(settings.truncate_future_on_manual_set)
         self.interpolation_mode = settings.baseline_mode.lower()
         if self.interpolation_mode not in {"linear", "cubic", "const-velocity"}:
             self.interpolation_mode = "linear"
         self.threshold_confidence = float(max(0.0, min(1.0, settings.issue_confidence_threshold)))
+        self.min_threshold_pixels = float(max(0.1, settings.deviation_threshold))
+        window = max(5, int(settings.optical_flow_window_size))
+        if window % 2 == 0:
+            window += 1
+        self.lk_window_size = window
+        self.lk_max_level = max(0, int(settings.optical_flow_pyramid))
+        self.lk_term_count = max(1, int(settings.optical_flow_term_count))
+        self.lk_term_epsilon = float(max(1e-7, settings.optical_flow_term_epsilon))
+        self.lk_feature_quality = float(max(0.0, min(1.0, settings.optical_flow_feature_quality)))
+        self.lk_min_distance = float(max(0.0, settings.optical_flow_min_distance))
+        self.lk_min_eig_threshold = float(max(1e-8, settings.optical_flow_min_eig_threshold))
+        self.lk_batch_size = max(1, int(settings.optical_flow_batch_size))
+        self.performance_mode = settings.performance_mode or "Balanced"
+        self.thread_priority = settings.thread_priority or "Normal"
+        self.cache_frames_enabled = bool(settings.cache_frames_enabled)
+        if not self.cache_frames_enabled:
+            with self._frame_lock:
+                self._frame_samples.clear()
+                self._frame_order.clear()
         self._invalidate_point_cache()
         self._trim_frame_store()
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _store_frame(self, frame_index: int, frame_bgr) -> None:
+    def _store_frame(self, frame_index: int, frame_bgr) -> Optional[FrameSample]:
         if frame_bgr is None:
-            return
-        if frame_index in self._frame_samples:
-            return
-        sample = FrameSample(frame_bgr.copy())
-        self._frame_samples[frame_index] = sample
-        self._frame_order.append(frame_index)
-        self._trim_frame_store()
+            return None
+        if not self.cache_frames_enabled:
+            return FrameSample(frame_bgr.copy())
+        with self._frame_lock:
+            existing = self._frame_samples.get(frame_index)
+            if existing is not None:
+                return existing
+            sample = FrameSample(frame_bgr.copy())
+            self._frame_samples[frame_index] = sample
+            self._frame_order.append(frame_index)
+            self._trim_frame_store_locked()
+            return sample
 
     def _trim_frame_store(self) -> None:
+        with self._frame_lock:
+            self._trim_frame_store_locked()
+
+    def _trim_frame_store_locked(self) -> None:
         limit = self.max_history_frames
         if limit <= 0:
+            self._frame_samples.clear()
+            self._frame_order.clear()
             return
         limit = max(limit, self.span_length + 2)
         while len(self._frame_order) > limit:

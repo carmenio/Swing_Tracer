@@ -9,6 +9,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from ..model import AppSettings, Point2D, SettingsManager
 from ..model.video import VideoPlayer
 from ..model.video import VideoPlayer
+from ..model.tracking.manager import TrackingJobState
 from .settings_dialog import SettingsDialog
 from .video_widget import VideoContainer
 from .timeline import DetailedTimeline, OverviewTimeline, TimelineMarker, clamp
@@ -159,6 +160,222 @@ class OffFrameDialog(QtWidgets.QDialog):
 
         self._refresh_list()
 
+
+class TrackingJobRow(QtWidgets.QFrame):
+    pauseRequested = QtCore.pyqtSignal(int)
+    resumeRequested = QtCore.pyqtSignal(int)
+    cancelRequested = QtCore.pyqtSignal(int)
+
+    def __init__(self, state: TrackingJobState, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self._state = state
+        self.setObjectName("TrackingJobRow")
+        self.setStyleSheet(
+            """
+            QFrame#TrackingJobRow {
+                background-color: #1a1a1a;
+                border: 1px solid #232323;
+                border-radius: 10px;
+            }
+            QLabel {
+                color: #f0f0f0;
+            }
+            """
+        )
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 12)
+        layout.setSpacing(6)
+
+        header = QtWidgets.QHBoxLayout()
+        header.setSpacing(6)
+        title_text = state.point_name or "Unnamed Point"
+        span = f"{state.span[0]}–{state.span[1]}"
+        self._title_label = QtWidgets.QLabel(f"{title_text}  ·  Frames {span}")
+        self._title_label.setStyleSheet("font-weight: 600; color: #fefefe;")
+        header.addWidget(self._title_label)
+        header.addStretch(1)
+
+        self._status_label = QtWidgets.QLabel()
+        self._status_label.setStyleSheet("color: #a0a0a0; font-size: 11px;")
+        header.addWidget(self._status_label)
+        layout.addLayout(header)
+
+        self._progress = QtWidgets.QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setTextVisible(False)
+        self._progress.setFixedHeight(6)
+        self._progress.setStyleSheet(
+            """
+            QProgressBar {
+                background-color: #242424;
+                border-radius: 3px;
+            }
+            QProgressBar::chunk {
+                background-color: #3fb984;
+                border-radius: 3px;
+            }
+            """
+        )
+        layout.addWidget(self._progress)
+
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.setSpacing(8)
+        self._pause_button = QtWidgets.QPushButton()
+        self._pause_button.setCursor(QtCore.Qt.PointingHandCursor)
+        self._pause_button.setFixedHeight(24)
+        self._pause_button.setStyleSheet(
+            """
+            QPushButton {
+                background-color: rgba(255,255,255,0.08);
+                border-radius: 8px;
+                border: 1px solid #2c2c2c;
+                padding: 4px 10px;
+                color: #f0f0f0;
+                font-size: 11px;
+            }
+            QPushButton:disabled {
+                color: #6f6f6f;
+                background-color: rgba(255,255,255,0.05);
+                border-color: #2a2a2a;
+            }
+            """
+        )
+        self._pause_button.clicked.connect(self._handle_pause_resume)
+        button_row.addWidget(self._pause_button)
+
+        self._cancel_button = QtWidgets.QPushButton("Cancel")
+        self._cancel_button.setCursor(QtCore.Qt.PointingHandCursor)
+        self._cancel_button.setFixedHeight(24)
+        self._cancel_button.setStyleSheet(
+            """
+            QPushButton {
+                background-color: rgba(255, 90, 90, 0.18);
+                border-radius: 8px;
+                border: 1px solid rgba(255, 90, 90, 0.4);
+                padding: 4px 12px;
+                color: #ffc7c7;
+                font-size: 11px;
+            }
+            QPushButton:disabled {
+                color: #6f6f6f;
+                background-color: rgba(255, 255, 255, 0.05);
+                border-color: #292929;
+            }
+            """
+        )
+        self._cancel_button.clicked.connect(lambda: self.cancelRequested.emit(self._state.job_id))
+        button_row.addWidget(self._cancel_button)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
+
+        self.update_state(state)
+
+    def update_state(self, state: TrackingJobState) -> None:
+        self._state = state
+        self._progress.setValue(int(max(0.0, min(1.0, state.progress)) * 100))
+        status_text = state.status
+        if state.message:
+            status_text = f"{status_text} · {state.message}"
+        self._status_label.setText(status_text)
+
+        if state.status == "Paused":
+            self._pause_button.setText("Resume")
+            self._pause_button.setEnabled(True)
+        elif state.status == "Running":
+            self._pause_button.setText("Pause")
+            self._pause_button.setEnabled(True)
+        else:
+            self._pause_button.setText("Pause")
+            self._pause_button.setEnabled(False)
+
+        self._cancel_button.setEnabled(state.status not in {"Completed", "Cancelled"})
+
+    def _handle_pause_resume(self) -> None:
+        if self._state.status == "Paused":
+            self.resumeRequested.emit(self._state.job_id)
+        elif self._state.status == "Running":
+            self.pauseRequested.emit(self._state.job_id)
+
+
+class TrackingJobsPopup(QtWidgets.QDialog):
+    pauseRequested = QtCore.pyqtSignal(int)
+    resumeRequested = QtCore.pyqtSignal(int)
+    cancelRequested = QtCore.pyqtSignal(int)
+    closed = QtCore.pyqtSignal()
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent, QtCore.Qt.Popup)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.setWindowFlags(QtCore.Qt.Popup | QtCore.Qt.FramelessWindowHint)
+        self.setMinimumWidth(340)
+        self._rows: Dict[int, TrackingJobRow] = {}
+
+        outer_layout = QtWidgets.QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        frame = QtWidgets.QFrame()
+        frame.setStyleSheet(
+            """
+            QFrame {
+                background-color: #111111;
+                border: 1px solid #2a2a2a;
+                border-radius: 12px;
+            }
+            """
+        )
+        frame_layout = QtWidgets.QVBoxLayout(frame)
+        frame_layout.setContentsMargins(12, 12, 12, 12)
+        frame_layout.setSpacing(10)
+
+        self._scroll = QtWidgets.QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self._scroll.setStyleSheet("QScrollArea { border: none; }")
+
+        self._container = QtWidgets.QWidget()
+        self._jobs_layout = QtWidgets.QVBoxLayout(self._container)
+        self._jobs_layout.setContentsMargins(0, 0, 0, 0)
+        self._jobs_layout.setSpacing(10)
+        self._jobs_layout.addStretch(1)
+
+        self._scroll.setWidget(self._container)
+        frame_layout.addWidget(self._scroll)
+
+        outer_layout.addWidget(frame)
+
+        self._empty_label = QtWidgets.QLabel("No active tracking jobs")
+        self._empty_label.setAlignment(QtCore.Qt.AlignCenter)
+        self._empty_label.setStyleSheet("color: #9f9f9f; font-size: 12px; padding: 12px 0;")
+        self._jobs_layout.insertWidget(0, self._empty_label)
+
+    def update_jobs(self, states: Dict[int, TrackingJobState]) -> None:
+        active_ids = set(states.keys())
+        for job_id in list(self._rows.keys()):
+            if job_id not in active_ids:
+                row = self._rows.pop(job_id)
+                row.setParent(None)
+                row.deleteLater()
+
+        for job_id, state in states.items():
+            row = self._rows.get(job_id)
+            if row is None:
+                row = TrackingJobRow(state, self)
+                row.pauseRequested.connect(self.pauseRequested)
+                row.resumeRequested.connect(self.resumeRequested)
+                row.cancelRequested.connect(self.cancelRequested)
+                self._rows[job_id] = row
+                self._jobs_layout.insertWidget(self._jobs_layout.count() - 1, row)
+            else:
+                row.update_state(state)
+
+        self._empty_label.setVisible(not bool(states))
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        super().closeEvent(event)
+        self.closed.emit()
+
     def _refresh_list(self) -> None:
         self.list_widget.clear()
         for start, end in self._merged_ranges():
@@ -290,6 +507,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
 
         self.setWindowTitle("Swing Tracker")
         self.resize(1440, 840)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
 
         self.issues_collapsed: bool = False
 
@@ -318,6 +536,10 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
 
         self._tracking_hide_timer = QtCore.QTimer(self)
         self._tracking_hide_timer.setSingleShot(True)
+        self._tracking_jobs_popup: Optional[TrackingJobsPopup] = None
+        self._job_states: Dict[int, TrackingJobState] = {}
+        self._selected_marker: Optional[Tuple[str, int]] = None
+        self._marker_lookup: Dict[Tuple[str, int], TimelineMarker] = {}
 
         self._apply_settings_to_ui()
         self._refresh_issue_panel()
@@ -605,9 +827,25 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         layout.setSpacing(12)
 
         header_layout = QtWidgets.QHBoxLayout()
-        title_label = QtWidgets.QLabel("Key Point Tracker")
-        title_label.setStyleSheet("font-size: 14px; font-weight: 600; color: #f4f4f4;")
-        header_layout.addWidget(title_label)
+        self.tracker_header_button = QtWidgets.QToolButton()
+        self.tracker_header_button.setText("Key Point Tracker")
+        self.tracker_header_button.setCursor(QtCore.Qt.PointingHandCursor)
+        self.tracker_header_button.setStyleSheet(
+            """
+            QToolButton {
+                border: none;
+                text-align: left;
+                font-size: 14px;
+                font-weight: 600;
+                color: #f4f4f4;
+            }
+            QToolButton:hover {
+                color: #ffffff;
+            }
+            """
+        )
+        self.tracker_header_button.clicked.connect(self._toggle_tracking_jobs_popup)
+        header_layout.addWidget(self.tracker_header_button)
 
         self.issue_count_badge = QtWidgets.QLabel("0")
         self.issue_count_badge.setFixedSize(22, 22)
@@ -849,6 +1087,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self.video_container.canvas.clicked.connect(self._handle_video_click)
 
         self.detailed_timeline.seekRequested.connect(self.seek_to_frame)
+        self.detailed_timeline.markerSelected.connect(self._on_timeline_marker_selected)
         self.overview_timeline.seekRequested.connect(self.seek_to_frame)
         self.overview_timeline.viewportChanged.connect(self._on_viewport_changed)
 
@@ -865,6 +1104,9 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         manager.tracking_finished.connect(self._on_tracking_finished)
         manager.segment_ready.connect(self._on_tracking_segment_ready)
         manager.segment_failed.connect(self._on_tracking_segment_failed)
+        manager.job_registered.connect(self._on_tracking_job_state)
+        manager.job_updated.connect(self._on_tracking_job_state)
+        manager.job_removed.connect(self._on_tracking_job_removed)
 
     def _format_speed_text(self, speed: float) -> str:
         return f"{speed:g}x"
@@ -971,6 +1213,51 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             self.tracker_progress_label.show()
             self._tracking_hide_timer.start(2000)
 
+    def _on_tracking_job_state(self, state_obj: object) -> None:
+        if isinstance(state_obj, TrackingJobState):
+            self._job_states[state_obj.job_id] = state_obj
+            self._update_tracking_jobs_popup()
+
+    def _on_tracking_job_removed(self, job_id: int) -> None:
+        if job_id in self._job_states:
+            self._job_states.pop(job_id, None)
+            self._update_tracking_jobs_popup()
+
+    def _toggle_tracking_jobs_popup(self) -> None:
+        if self._tracking_jobs_popup and self._tracking_jobs_popup.isVisible():
+            self._tracking_jobs_popup.close()
+            return
+        if self._tracking_jobs_popup is None:
+            self._tracking_jobs_popup = TrackingJobsPopup(self)
+            self._tracking_jobs_popup.pauseRequested.connect(self._pause_tracking_job)
+            self._tracking_jobs_popup.resumeRequested.connect(self._resume_tracking_job)
+            self._tracking_jobs_popup.cancelRequested.connect(self._cancel_tracking_job)
+            self._tracking_jobs_popup.closed.connect(self._on_tracking_popup_closed)
+        self._tracking_jobs_popup.update_jobs(self._job_states)
+        anchor = self.tracker_header_button.mapToGlobal(QtCore.QPoint(0, self.tracker_header_button.height()))
+        self._tracking_jobs_popup.move(anchor.x(), anchor.y())
+        self._tracking_jobs_popup.show()
+        self._tracking_jobs_popup.raise_()
+        self._tracking_jobs_popup.activateWindow()
+
+    def _update_tracking_jobs_popup(self) -> None:
+        if self._tracking_jobs_popup and self._tracking_jobs_popup.isVisible():
+            self._tracking_jobs_popup.update_jobs(self._job_states)
+
+    def _on_tracking_popup_closed(self) -> None:
+        if self._tracking_jobs_popup:
+            self._tracking_jobs_popup.deleteLater()
+            self._tracking_jobs_popup = None
+
+    def _pause_tracking_job(self, job_id: int) -> None:
+        self.tracking_manager.pause_job(job_id)
+
+    def _resume_tracking_job(self, job_id: int) -> None:
+        self.tracking_manager.resume_job(job_id)
+
+    def _cancel_tracking_job(self, job_id: int) -> None:
+        self.tracking_manager.cancel_job(job_id)
+
     # ------------------------------------------------------------------
     # Video workflow
     # ------------------------------------------------------------------
@@ -986,7 +1273,6 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         if self.playback_timer.isActive():
             self.playback_timer.stop()
         self._update_play_button(False)
-        self.tracking_manager.reset()
         self._hide_tracking_feedback()
 
         try:
@@ -995,6 +1281,11 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         except ValueError:
             QtWidgets.QMessageBox.critical(self, "Error", "Failed to open video.")
             return
+
+        self._close_tracking_jobs_popup()
+        self.tracking_manager.reset()
+        self._job_states.clear()
+        self._update_tracking_jobs_popup()
 
         self.controller.set_tracking_video_path(Path(file_path))
 
@@ -1067,7 +1358,10 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._reset_playback_clock()
         self.video_player.reset()
         self.custom_tracker.reset()
+        self._close_tracking_jobs_popup()
         self.tracking_manager.reset()
+        self._job_states.clear()
+        self._update_tracking_jobs_popup()
         self._hide_tracking_feedback()
         self.current_frame_bgr = None
         self._refresh_issue_panel()
@@ -1931,22 +2225,13 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
 
     def _update_timeline_markers(self) -> None:
         markers: List[TimelineMarker] = []
-        if not self.video_player.is_loaded() or not self.active_point:
+        self._marker_lookup = {}
+        if not self.video_player.is_loaded():
             self.detailed_timeline.set_markers(markers)
             self.overview_timeline.set_markers(markers)
             self.detailed_timeline.set_segments([])
             self.overview_timeline.set_segments([])
             return
-
-        tracked_point = self.custom_tracker.point_definitions().get(self.active_point)
-        if not tracked_point:
-            self.detailed_timeline.set_markers(markers)
-            self.overview_timeline.set_markers(markers)
-            self.detailed_timeline.set_segments([])
-            self.overview_timeline.set_segments([])
-            return
-
-        self.tracking_manager.request_point(self.active_point)
 
         frame_count = self.video_player.metadata.frame_count
         max_frame = frame_count - 1 if frame_count > 0 else None
@@ -1958,53 +2243,62 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
                 return True
             return frame <= max_frame
 
-        marker_records: Dict[int, Tuple[int, TimelineMarker]] = {}
+        marker_records: Dict[Tuple[int, str], Tuple[int, TimelineMarker]] = {}
 
-        def register_marker(frame: int, color: QtGui.QColor, category: str, priority: int) -> None:
+        def register_marker(point_name: str, frame: int, color: QtGui.QColor, category: str, priority: int) -> None:
             if not in_bounds(frame):
                 return
-            normalized = TimelineMarker(int(frame), QtGui.QColor(color), category)
-            existing = marker_records.get(normalized.frame)
+            normalized = TimelineMarker(int(frame), QtGui.QColor(color), category, point_name)
+            key = (normalized.frame, normalized.point_name or "")
+            existing = marker_records.get(key)
             if existing and existing[0] > priority:
                 return
-            marker_records[normalized.frame] = (priority, normalized)
+            marker_records[key] = (priority, normalized)
 
-        base_color = QtGui.QColor(*tracked_point.color)
-        base_color.setAlpha(235)
-        auto_color = QtGui.QColor(255, 170, 60)
-        auto_color.setAlpha(150)
-        absence_color = QtGui.QColor(255, 80, 80)
-        absence_color.setAlpha(170)
-        provisional_color = QtGui.QColor(base_color)
-        provisional_color.setAlpha(190)
+        for point_name, tracked_point in self.custom_tracker.point_definitions().items():
+            base_color = QtGui.QColor(*tracked_point.color)
+            base_color.setAlpha(235)
+            auto_color = QtGui.QColor(255, 170, 60, 150)
+            provisional_color = QtGui.QColor(base_color)
+            provisional_color.setAlpha(190)
+            absence_color = QtGui.QColor(255, 80, 80, 170)
 
-        manual_frames = set(tracked_point.accepted_keyframe_frames())
-        for frame in manual_frames:
-            register_marker(frame, base_color, "manual", 80)
+            manual_frames = set(tracked_point.accepted_keyframe_frames())
+            for frame in manual_frames:
+                register_marker(point_name, frame, base_color, "manual", 80)
 
-        auto_frames = set(tracked_point.keyframe_frames()) - manual_frames
-        for frame in auto_frames:
-            register_marker(frame, auto_color, "auto", 60)
+            auto_frames = set(tracked_point.keyframe_frames()) - manual_frames
+            for frame in auto_frames:
+                register_marker(point_name, frame, auto_color, "auto", 60)
 
-        for anchor in self.custom_tracker.provisional_markers(self.active_point):
-            if anchor.frame in manual_frames:
-                continue
-            register_marker(anchor.frame, provisional_color, "provisional", 70)
+            for anchor in self.custom_tracker.provisional_markers(point_name):
+                if anchor.frame in manual_frames:
+                    continue
+                register_marker(point_name, anchor.frame, provisional_color, "provisional", 70)
 
-        for start, end in tracked_point.absent_ranges:
-            register_marker(start, absence_color, "stop", 100)
-            resume_frame = end + 1
-            register_marker(resume_frame, absence_color, "start", 100)
+            for start, end in tracked_point.absent_ranges:
+                register_marker(point_name, start, absence_color, "stop", 100)
+                resume_frame = end + 1
+                register_marker(point_name, resume_frame, absence_color, "start", 100)
 
-        if tracked_point.open_absence_start is not None:
-            register_marker(tracked_point.open_absence_start, absence_color, "stop", 100)
+            if tracked_point.open_absence_start is not None:
+                register_marker(point_name, tracked_point.open_absence_start, absence_color, "stop", 100)
 
-        markers = [entry[1] for entry in sorted(marker_records.values(), key=lambda item: item[1].frame)]
-        segments = self.custom_tracker.tracking_segments(self.active_point)
+        markers = [entry[1] for entry in sorted(marker_records.values(), key=lambda item: (item[1].frame, item[1].point_name or ""))]
+        self._marker_lookup = {(marker.point_name or "", marker.frame): marker for marker in markers}
+
+        segments = self.custom_tracker.all_tracking_segments()
         self.detailed_timeline.set_markers(markers)
         self.overview_timeline.set_markers(markers)
         self.detailed_timeline.set_segments(segments)
         self.overview_timeline.set_segments(segments)
+
+        if self._selected_marker:
+            self.detailed_timeline.set_selected_marker(self._selected_marker[0], self._selected_marker[1])
+        else:
+            self.detailed_timeline.set_selected_marker(None, None)
+
+        self.tracking_manager.request_all()
 
     def _update_timeline_absences(self) -> None:
         ranges: List[Tuple[int, int]] = []
@@ -2024,6 +2318,39 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
     @property
     def trail_length(self) -> int:
         return max(1, int(self.settings.general.trail_length))
+
+    def _on_timeline_marker_selected(self, point_name: str, frame_index: int, category: str) -> None:
+        normalized_name = point_name or ""
+        self._selected_marker = (normalized_name, frame_index)
+        self.detailed_timeline.set_selected_marker(normalized_name or None, frame_index)
+        if normalized_name and normalized_name in self.custom_tracker.point_definitions() and normalized_name != (self.active_point or ""):
+            self._set_active_point(normalized_name)
+        self.seek_to_frame(frame_index)
+        self.setFocus()
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace):
+            if self._selected_marker:
+                point_name, frame_index = self._selected_marker
+                marker = self._marker_lookup.get((point_name, frame_index))
+                if marker and marker.category == "manual" and point_name:
+                    if self.custom_tracker.delete_keyframe(point_name, frame_index):
+                        self._after_keyframe_deleted(point_name, frame_index)
+                        event.accept()
+                        return
+        super().keyPressEvent(event)
+
+    def _after_keyframe_deleted(self, point_name: str, frame_index: int) -> None:
+        self._selected_marker = None
+        self.detailed_timeline.set_selected_marker(None, None)
+        self.tracking_manager.request_point(point_name)
+        self._refresh_issue_panel()
+        self._update_timeline_markers()
+        self._render_current_frame()
+
+    def _close_tracking_jobs_popup(self) -> None:
+        if self._tracking_jobs_popup and self._tracking_jobs_popup.isVisible():
+            self._tracking_jobs_popup.close()
 
     def _update_play_button(self, playing: bool) -> None:
         self.play_toggle.setText("⏸" if playing else "▶")
@@ -2046,6 +2373,8 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self.playback_timer.stop()
         self._decoder_thread.quit()
         self._decoder_thread.wait(1500)
+        self._close_tracking_jobs_popup()
+        self._job_states.clear()
         self.tracking_manager.shutdown()
         self.controller.set_tracking_video_path(None)
         self.video_player.release()

@@ -147,6 +147,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.tabs.setDocumentMode(True)
 
         self._general_tab = self._wrap_with_scroll(self._build_general_tab())
+        self._tracking_tab = self._wrap_with_scroll(self._build_tracking_tab())
         self._timeline_tab = self._wrap_with_scroll(self._build_timeline_tab())
         self._playback_tab = self._wrap_with_scroll(self._build_playback_tab())
         self._input_tab = self._wrap_with_scroll(self._build_input_tab())
@@ -154,6 +155,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self._data_tab = self._wrap_with_scroll(self._build_data_tab())
 
         self.tabs.addTab(self._general_tab, "General")
+        self.tabs.addTab(self._tracking_tab, "Tracking")
         self.tabs.addTab(self._timeline_tab, "Timeline")
         self.tabs.addTab(self._playback_tab, "Playback")
         self.tabs.addTab(self._input_tab, "Input")
@@ -251,6 +253,70 @@ class SettingsDialog(QtWidgets.QDialog):
         self.general_trail_slider.valueChanged.connect(
             lambda value: self.general_trail_value.setText(str(value))
         )
+        return widget
+
+    def _build_tracking_tab(self) -> QtWidgets.QWidget:
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(widget)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(18)
+
+        form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(QtCore.Qt.AlignLeft)
+        form.setFormAlignment(QtCore.Qt.AlignTop)
+        form.setVerticalSpacing(14)
+        layout.addLayout(form)
+
+        self.track_window_spin = QtWidgets.QSpinBox()
+        self.track_window_spin.setRange(5, 61)
+        self.track_window_spin.setSingleStep(2)
+        self.track_window_spin.setSuffix(" px")
+        form.addRow("Optical Flow Window Size", self.track_window_spin)
+
+        self.track_pyramid_spin = QtWidgets.QSpinBox()
+        self.track_pyramid_spin.setRange(0, 6)
+        self.track_pyramid_spin.setSuffix(" levels")
+        form.addRow("Maximum Pyramid Levels", self.track_pyramid_spin)
+
+        self.track_term_iter_spin = QtWidgets.QSpinBox()
+        self.track_term_iter_spin.setRange(1, 100)
+        self.track_term_iter_spin.setSuffix(" iterations")
+        form.addRow("Termination Iterations", self.track_term_iter_spin)
+
+        self.track_term_eps_spin = QtWidgets.QDoubleSpinBox()
+        self.track_term_eps_spin.setDecimals(4)
+        self.track_term_eps_spin.setRange(0.0001, 0.1)
+        self.track_term_eps_spin.setSingleStep(0.0005)
+        form.addRow("Termination Epsilon", self.track_term_eps_spin)
+
+        self.track_feature_quality = QtWidgets.QDoubleSpinBox()
+        self.track_feature_quality.setDecimals(2)
+        self.track_feature_quality.setRange(0.0, 1.0)
+        self.track_feature_quality.setSingleStep(0.05)
+        form.addRow("Feature Quality Threshold", self.track_feature_quality)
+
+        self.track_min_distance = QtWidgets.QDoubleSpinBox()
+        self.track_min_distance.setDecimals(2)
+        self.track_min_distance.setRange(0.0, 10.0)
+        self.track_min_distance.setSingleStep(0.1)
+        self.track_min_distance.setSuffix(" px")
+        form.addRow("Minimum Distance Between Points", self.track_min_distance)
+
+        self.track_smoothing_alpha = QtWidgets.QDoubleSpinBox()
+        self.track_smoothing_alpha.setDecimals(2)
+        self.track_smoothing_alpha.setRange(0.0, 1.0)
+        self.track_smoothing_alpha.setSingleStep(0.05)
+        form.addRow("Smoothing / Interpolation Strength", self.track_smoothing_alpha)
+
+        self.track_performance_mode = QtWidgets.QComboBox()
+        self.track_performance_mode.addItems(["Balanced", "High"])
+        form.addRow("Performance Mode", self.track_performance_mode)
+
+        self.track_thread_priority = QtWidgets.QComboBox()
+        self.track_thread_priority.addItems(["Lowest", "Low", "Normal", "High", "Highest", "TimeCritical"])
+        form.addRow("Worker Thread Priority", self.track_thread_priority)
+
+        layout.addStretch(1)
         return widget
 
     def _build_timeline_tab(self) -> QtWidgets.QWidget:
@@ -618,6 +684,20 @@ class SettingsDialog(QtWidgets.QDialog):
         g.viewport_start = start
         g.viewport_end = end
         g.theme = self.general_theme.currentText()
+
+        tr = self.settings.tracking
+        window = self.track_window_spin.value()
+        if window % 2 == 0:
+            window += 1
+        tr.optical_flow_window_size = window
+        tr.optical_flow_pyramid = self.track_pyramid_spin.value()
+        tr.optical_flow_term_count = self.track_term_iter_spin.value()
+        tr.optical_flow_term_epsilon = self.track_term_eps_spin.value()
+        tr.optical_flow_feature_quality = self.track_feature_quality.value()
+        tr.optical_flow_min_distance = self.track_min_distance.value()
+        tr.smoothing_alpha = self.track_smoothing_alpha.value()
+        tr.performance_mode = self.track_performance_mode.currentText()
+        tr.thread_priority = self.track_thread_priority.currentText()
 
         tl = self.settings.timeline
         for key, btn in self.timeline_color_buttons.items():

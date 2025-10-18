@@ -122,6 +122,7 @@ class TrackingSegment:
     provisional_points: List[KeyFrame] = field(default_factory=list)
     accepted: bool = False
     entity_colour: Optional[str] = None
+    point_name: Optional[str] = None
 
     def color_stops(self) -> List[Tuple[int, str]]:
         """
@@ -207,6 +208,14 @@ class SegmentBuilder:
         min_improvement_ratio: float,
         smoothing_window: int,
         entity_colour: Optional[str] = None,
+        lk_window_size: Tuple[int, int] = (21, 21),
+        lk_max_level: int = 3,
+        lk_term_count: int = 30,
+        lk_term_epsilon: float = 0.01,
+        lk_min_eig_threshold: float = 1e-4,
+        feature_quality_threshold: float = 0.4,
+        min_track_distance: float = 0.0,
+        batch_size: int = 8,
     ) -> None:
         self.baseline_mode = baseline_mode
         self.threshold_confidence = threshold_confidence
@@ -219,6 +228,24 @@ class SegmentBuilder:
         self.min_improvement_ratio = min_improvement_ratio
         self.smoothing_window = smoothing_window
         self.entity_colour = entity_colour
+        if isinstance(lk_window_size, tuple):
+            width = max(5, int(lk_window_size[0]))
+            height = max(5, int(lk_window_size[1]))
+        else:
+            width = max(5, int(lk_window_size))
+            height = width
+        if width % 2 == 0:
+            width += 1
+        if height % 2 == 0:
+            height += 1
+        self.lk_window_size = (width, height)
+        self.lk_max_level = max(0, int(lk_max_level))
+        self.lk_term_count = max(1, int(lk_term_count))
+        self.lk_term_epsilon = float(max(1e-7, lk_term_epsilon))
+        self.lk_min_eig_threshold = float(max(1e-8, lk_min_eig_threshold))
+        self.feature_quality_threshold = float(max(0.0, min(1.0, feature_quality_threshold)))
+        self.min_track_distance = float(max(0.0, min_track_distance))
+        self.batch_size = max(1, int(batch_size))
 
     def build(
         self,
@@ -337,15 +364,24 @@ class SegmentBuilder:
         confidences: Dict[int, float] = {span_start: 1.0}
         fb_errors: Dict[int, float] = {span_start: 0.0}
 
-        prev_frame = frames[span_start].gray
+        prev_sample = frames.get(span_start)
+        if prev_sample is None:
+            return OpticalFlowResult(positions=positions, confidences=confidences, fb_errors=fb_errors)
+        prev_frame = prev_sample.gray
         prev_point = np.array([[start_pos]], dtype=np.float32)
 
-        lk_params = dict(winSize=(21, 21), maxLevel=3, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+        lk_params = dict(
+            winSize=self.lk_window_size,
+            maxLevel=self.lk_max_level,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, self.lk_term_count, self.lk_term_epsilon),
+            minEigThreshold=self.lk_min_eig_threshold,
+        )
 
         total_frames = max(1, span_end - span_start)
         if progress_callback is not None:
             progress_callback(0.0)
 
+        batch_counter = 0
         for frame_index in range(span_start + 1, span_end + 1):
             current_sample = frames.get(frame_index)
             if current_sample is None:
@@ -361,6 +397,12 @@ class SegmentBuilder:
 
             # Extract the (x, y) position from the optical flow output
             pos = (float(next_pt[0, 0, 0]), float(next_pt[0, 0, 1]))
+            if self.min_track_distance > 0.0 and frame_index > span_start:
+                displacement = float(np.linalg.norm(next_pt - prev_point))
+                if displacement < self.min_track_distance:
+                    confidence *= max(0.25, displacement / max(self.min_track_distance, 1.0))
+            if confidence < self.feature_quality_threshold:
+                break
             positions[frame_index] = pos
             confidences[frame_index] = confidence
             fb_errors[frame_index] = fb_distance if math.isfinite(fb_distance) else 1e6
@@ -368,9 +410,11 @@ class SegmentBuilder:
             prev_frame = current_frame
             prev_point = next_pt
 
-            if progress_callback is not None:
+            batch_counter += 1
+            if progress_callback is not None and (batch_counter >= self.batch_size or frame_index == span_end):
                 progress = (frame_index - span_start) / total_frames
                 progress_callback(min(1.0, max(0.0, progress)))
+                batch_counter = 0
 
         if progress_callback is not None:
             progress_callback(1.0)
