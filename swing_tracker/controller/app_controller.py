@@ -48,6 +48,10 @@ class SwingTrackerController:
     def tracking_manager(self):
         return self._model.tracking_manager
 
+    @property
+    def video_path(self) -> Optional[Path]:
+        return self._model.video_path
+
     def set_tracking_video_path(self, path: Optional[Path]) -> None:
         self._model.set_tracking_video_path(path)
 

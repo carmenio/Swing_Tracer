@@ -1,5 +1,7 @@
 from bisect import bisect_left
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
+import logging
+import json
 
 from pathlib import Path
 
@@ -351,14 +353,19 @@ class TrackingJobsPopup(QtWidgets.QDialog):
         self._jobs_layout.insertWidget(0, self._empty_label)
 
     def update_jobs(self, states: Dict[int, TrackingJobState]) -> None:
-        active_ids = set(states.keys())
+        filtered = {
+            job_id: state
+            for job_id, state in states.items()
+            if state.status in {"Running", "Paused"}
+        }
+        active_ids = set(filtered.keys())
         for job_id in list(self._rows.keys()):
             if job_id not in active_ids:
                 row = self._rows.pop(job_id)
                 row.setParent(None)
                 row.deleteLater()
 
-        for job_id, state in states.items():
+        for job_id, state in filtered.items():
             row = self._rows.get(job_id)
             if row is None:
                 row = TrackingJobRow(state, self)
@@ -370,7 +377,7 @@ class TrackingJobsPopup(QtWidgets.QDialog):
             else:
                 row.update_state(state)
 
-        self._empty_label.setVisible(not bool(states))
+        self._empty_label.setVisible(not bool(filtered))
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         super().closeEvent(event)
@@ -504,6 +511,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self.controller = controller
         self.controller.set_view(self)
         self.tracking_manager = self.controller.tracking_manager
+        self._log = logging.getLogger(__name__)
 
         self.setWindowTitle("Swing Tracker")
         self.resize(1440, 840)
@@ -540,6 +548,12 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._job_states: Dict[int, TrackingJobState] = {}
         self._selected_marker: Optional[Tuple[str, int]] = None
         self._marker_lookup: Dict[Tuple[str, int], TimelineMarker] = {}
+        self._active_issue_point: Optional[str] = None
+        self._auto_save_timer = QtCore.QTimer(self)
+        self._auto_save_timer.setSingleShot(True)
+        self._auto_save_timer.timeout.connect(self._perform_autosave)
+        self._auto_save_dirty: bool = False
+        self._auto_save_interval_ms: int = 0
 
         self._apply_settings_to_ui()
         self._refresh_issue_panel()
@@ -834,10 +848,10 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             """
             QToolButton {
                 border: none;
-                text-align: left;
                 font-size: 14px;
                 font-weight: 600;
                 color: #f4f4f4;
+                padding: 0;
             }
             QToolButton:hover {
                 color: #ffffff;
@@ -1215,12 +1229,24 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
 
     def _on_tracking_job_state(self, state_obj: object) -> None:
         if isinstance(state_obj, TrackingJobState):
-            self._job_states[state_obj.job_id] = state_obj
+            self._log.debug(
+                "UI: job update id=%s point=%s span=%s status=%s progress=%.2f",
+                state_obj.job_id,
+                state_obj.point_name,
+                state_obj.span,
+                state_obj.status,
+                state_obj.progress,
+            )
+            if state_obj.status in {"Running", "Paused"}:
+                self._job_states[state_obj.job_id] = state_obj
+            else:
+                self._job_states.pop(state_obj.job_id, None)
             self._update_tracking_jobs_popup()
 
     def _on_tracking_job_removed(self, job_id: int) -> None:
         if job_id in self._job_states:
             self._job_states.pop(job_id, None)
+            self._log.debug("UI: job removed id=%s", job_id)
             self._update_tracking_jobs_popup()
 
     def _toggle_tracking_jobs_popup(self) -> None:
@@ -1270,10 +1296,15 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
 
         file_path = dialog.selectedFiles()[0]
 
+        if self.video_player.is_loaded():
+            self._flush_autosave()
+
         if self.playback_timer.isActive():
             self.playback_timer.stop()
         self._update_play_button(False)
         self._hide_tracking_feedback()
+        self._auto_save_timer.stop()
+        self._auto_save_dirty = False
 
         try:
             self.controller.set_tracking_video_path(None)
@@ -1288,6 +1319,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._update_tracking_jobs_popup()
 
         self.controller.set_tracking_video_path(Path(file_path))
+        self._update_auto_save_settings()
 
         self.viewport_range = (
             self.settings.general.viewport_start,
@@ -1312,6 +1344,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self.mark_stop_button.setEnabled(True)
 
         self._initialize_points()
+        self._load_autosave_if_available()
         self._refresh_issue_panel()
 
         first_frame = self.video_player.read_first_frame()
@@ -1350,6 +1383,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
     def stop_playback(self) -> None:
         if not self.video_player.is_loaded():
             return
+        self._flush_autosave()
         self.playback_timer.stop()
         self._update_play_button(False)
         self._decode_in_flight = False
@@ -1363,6 +1397,8 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._job_states.clear()
         self._update_tracking_jobs_popup()
         self._hide_tracking_feedback()
+        self._auto_save_timer.stop()
+        self._auto_save_dirty = False
         self.current_frame_bgr = None
         self._refresh_issue_panel()
         self.current_time_label.setText("0:00")
@@ -1688,113 +1724,137 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
 
         self._issue_items = []
 
-        if not self.video_player.is_loaded() or not self.active_point:
-            placeholder = QtWidgets.QLabel("Load a video and select a point to review tracking suggestions.")
+        if not self.video_player.is_loaded():
+            placeholder = QtWidgets.QLabel("Load a video to review tracking suggestions.")
             placeholder.setWordWrap(True)
             placeholder.setAlignment(QtCore.Qt.AlignCenter)
             placeholder.setStyleSheet("color: #6f6f6f; font-size: 12px; padding: 16px 8px;")
             self.issue_list_layout.addWidget(placeholder)
             self.issue_list_layout.addStretch(1)
+            self._active_issue_point = None
             self._active_issue_frame = None
             self.detailed_timeline.clear_highlight()
             self._update_issue_selection_styles()
             self._update_timeline_markers()
             return
 
-        current_frame = self.video_player.current_frame_index
-        chain = self.custom_tracker.provisional_chain_for_frame(self.active_point, current_frame)
-        provisionals = chain.provisionals() if chain else []
+        point_names: List[str] = list(self.point_definitions.keys())
+        any_rows = False
 
-        if not provisionals:
-            placeholder = QtWidgets.QLabel("No provisional key points detected in this 50-frame span.")
+        for point_name in point_names:
+            spans = self.custom_tracker.span_pairs(point_name)
+            point_has_rows = False
+            for span in spans:
+                chain = self.custom_tracker.provisional_chain_for_span(point_name, span)
+                if not chain:
+                    continue
+                provisionals = chain.provisionals()
+                if not provisionals:
+                    continue
+
+                if not point_has_rows:
+                    point_label = QtWidgets.QLabel(point_name)
+                    point_label.setStyleSheet("color: #f0f0f0; font-size: 13px; font-weight: 600; padding: 4px 0;")
+                    self.issue_list_layout.addWidget(point_label)
+                    point_has_rows = True
+
+                header = QtWidgets.QFrame()
+                header.setStyleSheet(
+                    """
+                    QFrame {
+                        background-color: rgba(255, 255, 255, 0.04);
+                        border-radius: 10px;
+                    }
+                    """
+                )
+                header_layout = QtWidgets.QHBoxLayout(header)
+                header_layout.setContentsMargins(10, 6, 10, 6)
+                header_layout.setSpacing(8)
+
+                span_label = QtWidgets.QLabel(f"Span F{span[0]} – F{span[1]}")
+                span_label.setStyleSheet("color: #f0f0f0; font-size: 12px; font-weight: 600;")
+                header_layout.addWidget(span_label)
+
+                header_layout.addStretch(1)
+
+                accept_all = QtWidgets.QPushButton("Accept All")
+                accept_all.setCursor(QtCore.Qt.PointingHandCursor)
+                accept_all.setStyleSheet(
+                    """
+                    QPushButton {
+                        background-color: rgba(80, 200, 120, 0.2);
+                        border: 1px solid rgba(80, 200, 120, 0.4);
+                        border-radius: 12px;
+                        font-size: 11px;
+                        padding: 4px 10px;
+                        color: #c8f7da;
+                    }
+                    QPushButton:hover {
+                        background-color: rgba(80, 200, 120, 0.3);
+                    }
+                    """
+                )
+                accept_all.clicked.connect(
+                    lambda _, p=point_name, s=span: self._accept_all_provisionals(p, s)
+                )
+                header_layout.addWidget(accept_all)
+
+                reject_all = QtWidgets.QPushButton("Reject All")
+                reject_all.setCursor(QtCore.Qt.PointingHandCursor)
+                reject_all.setStyleSheet(
+                    """
+                    QPushButton {
+                        background-color: rgba(220, 80, 80, 0.18);
+                        border: 1px solid rgba(220, 80, 80, 0.35);
+                        border-radius: 12px;
+                        font-size: 11px;
+                        padding: 4px 10px;
+                        color: #ffc7c7;
+                    }
+                    QPushButton:hover {
+                        background-color: rgba(220, 80, 80, 0.28);
+                    }
+                    """
+                )
+                reject_all.clicked.connect(
+                    lambda _, p=point_name, s=span: self._reject_all_provisionals(p, s)
+                )
+                header_layout.addWidget(reject_all)
+
+                self.issue_list_layout.addWidget(header)
+
+                sorted_candidates = sorted(provisionals, key=lambda c: c.anchor.frame)
+                for candidate in sorted_candidates:
+                    row, metadata = self._build_provisional_row(
+                        point_name,
+                        span,
+                        chain,
+                        candidate,
+                    )
+                    self._issue_items.append(metadata)
+                    self.issue_list_layout.addWidget(row)
+                    any_rows = True
+
+        if not any_rows:
+            placeholder = QtWidgets.QLabel("No provisional key points detected across tracked points.")
             placeholder.setAlignment(QtCore.Qt.AlignCenter)
             placeholder.setStyleSheet("color: #6f6f6f; font-size: 12px; padding: 16px 8px;")
             self.issue_list_layout.addWidget(placeholder)
             self.issue_list_layout.addStretch(1)
+            self._active_issue_point = None
             self._active_issue_frame = None
             self.detailed_timeline.clear_highlight()
             self._update_issue_selection_styles()
             self._update_timeline_markers()
             return
 
-        header = QtWidgets.QFrame()
-        header.setStyleSheet(
-            """
-            QFrame {
-                background-color: rgba(255, 255, 255, 0.04);
-                border-radius: 10px;
-            }
-            """
-        )
-        header_layout = QtWidgets.QHBoxLayout(header)
-        header_layout.setContentsMargins(10, 6, 10, 6)
-        header_layout.setSpacing(8)
-
-        span_label = QtWidgets.QLabel(f"Span F{chain.span_start} – F{chain.span_end}")
-        span_label.setStyleSheet("color: #f0f0f0; font-size: 12px; font-weight: 600;")
-        header_layout.addWidget(span_label)
-
-        header_layout.addStretch(1)
-
-        accept_all = QtWidgets.QPushButton("Accept All Shown")
-        accept_all.setCursor(QtCore.Qt.PointingHandCursor)
-        accept_all.setStyleSheet(
-            """
-            QPushButton {
-                background-color: rgba(80, 200, 120, 0.2);
-                border: 1px solid rgba(80, 200, 120, 0.4);
-                border-radius: 12px;
-                font-size: 11px;
-                padding: 4px 10px;
-                color: #c8f7da;
-            }
-            QPushButton:hover {
-                background-color: rgba(80, 200, 120, 0.3);
-            }
-            """
-        )
-        accept_all.clicked.connect(
-            lambda _, p=self.active_point, span=(chain.span_start, chain.span_end): self._accept_all_provisionals(p, span)
-        )
-        header_layout.addWidget(accept_all)
-
-        reject_all = QtWidgets.QPushButton("Reject All Shown")
-        reject_all.setCursor(QtCore.Qt.PointingHandCursor)
-        reject_all.setStyleSheet(
-            """
-            QPushButton {
-                background-color: rgba(220, 80, 80, 0.18);
-                border: 1px solid rgba(220, 80, 80, 0.35);
-                border-radius: 12px;
-                font-size: 11px;
-                padding: 4px 10px;
-                color: #ffc7c7;
-            }
-            QPushButton:hover {
-                background-color: rgba(220, 80, 80, 0.28);
-            }
-            """
-        )
-        reject_all.clicked.connect(
-            lambda _, p=self.active_point, span=(chain.span_start, chain.span_end): self._reject_all_provisionals(p, span)
-        )
-        header_layout.addWidget(reject_all)
-
-        self.issue_list_layout.addWidget(header)
-
-        sorted_candidates = sorted(provisionals, key=lambda c: c.anchor.frame)
-        for candidate in sorted_candidates:
-            row, metadata = self._build_provisional_row(
-                self.active_point,
-                (chain.span_start, chain.span_end),
-                chain,
-                candidate,
-            )
-            self._issue_items.append(metadata)
-            self.issue_list_layout.addWidget(row)
-
-        frames_present = {item["frame"] for item in self._issue_items}
-        if self._active_issue_frame is not None and self._active_issue_frame not in frames_present:
+        frames_present = {(item["point"], item["frame"]) for item in self._issue_items}
+        if (
+            self._active_issue_point is not None
+            and self._active_issue_frame is not None
+            and (self._active_issue_point, self._active_issue_frame) not in frames_present
+        ):
+            self._active_issue_point = None
             self._active_issue_frame = None
 
         self.issue_list_layout.addStretch(1)
@@ -1882,8 +1942,8 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             }
             """
         )
-        row.clicked.connect(lambda f=candidate.anchor.frame: self._focus_issue(f))
-        jump_button.clicked.connect(lambda _, f=candidate.anchor.frame: self._focus_issue(f))
+        row.clicked.connect(lambda _, p=point_name, f=candidate.anchor.frame: self._focus_issue_point(p, f))
+        jump_button.clicked.connect(lambda _, p=point_name, f=candidate.anchor.frame: self._focus_issue_point(p, f))
         button_column.addWidget(jump_button)
 
         accept_button = QtWidgets.QPushButton("Accept")
@@ -1945,51 +2005,75 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             self.tracking_manager.request_point(point_name)
             self._update_timeline_markers()
             self._refresh_issue_panel()
-            self._advance_to_next_issue(frame_index)
+            self._advance_to_next_issue(frame_index, point_name)
+            self._mark_autosave_dirty()
 
     def _reject_provisional_candidate(self, point_name: str, span: Tuple[int, int], frame_index: int) -> None:
         if self.custom_tracker.reject_provisional(point_name, span, frame_index):
             self.tracking_manager.request_point(point_name)
             self._update_timeline_markers()
             self._refresh_issue_panel()
-            self._advance_to_next_issue(frame_index, pause_when_empty=True)
+            self._advance_to_next_issue(frame_index, point_name, pause_when_empty=True)
+            self._mark_autosave_dirty()
 
     def _accept_all_provisionals(self, point_name: str, span: Tuple[int, int]) -> None:
         if self.custom_tracker.accept_all_provisionals(point_name, span):
             self.tracking_manager.request_point(point_name)
             self._update_timeline_markers()
             self._refresh_issue_panel()
-            self._advance_to_next_issue(span[1])
+            self._advance_to_next_issue(-1, None)
+            self._mark_autosave_dirty()
 
     def _reject_all_provisionals(self, point_name: str, span: Tuple[int, int]) -> None:
         if self.custom_tracker.reject_all_provisionals(point_name, span):
             self.tracking_manager.request_point(point_name)
             self._update_timeline_markers()
             self._refresh_issue_panel()
-            self._advance_to_next_issue(span[1], pause_when_empty=True)
+            self._advance_to_next_issue(-1, None, pause_when_empty=True)
+            self._mark_autosave_dirty()
 
-    def _focus_issue(self, frame_index: int) -> None:
+    def _focus_issue_point(self, point_name: str, frame_index: int) -> None:
         if not self.video_player.is_loaded():
             return
+        self._log.debug("UI: focus_issue point=%s frame=%s", point_name, frame_index)
+        if point_name and point_name in self.point_definitions and point_name != (self.active_point or ""):
+            self._set_active_point(point_name)
         was_playing = self.playback_timer.isActive()
+        self._active_issue_point = point_name
         self._active_issue_frame = frame_index
         self.seek_to_frame(frame_index, resume_playback=was_playing)
         self._ensure_viewport_contains_frame(frame_index)
         self.detailed_timeline.pulse_highlight(frame_index)
         self._update_issue_selection_styles()
 
-    def _advance_to_next_issue(self, previous_frame: int, pause_when_empty: bool = False) -> None:
+    def _advance_to_next_issue(
+        self,
+        previous_frame: int,
+        previous_point: Optional[str] = None,
+        pause_when_empty: bool = False,
+    ) -> None:
         if not self._issue_items:
             self._handle_no_remaining_issues(pause_when_empty)
             return
-        sorted_items = sorted(self._issue_items, key=lambda item: item["frame"])
-        next_item = next((item for item in sorted_items if item["frame"] > previous_frame), None)
+        sorted_items = sorted(self._issue_items, key=lambda item: (item["frame"], item["point"]))
+
+        def is_after(item: Dict[str, Any]) -> bool:
+            frame = item["frame"]
+            point = item.get("point")
+            if frame > previous_frame:
+                return True
+            if frame == previous_frame and previous_point is not None and point != previous_point:
+                return True
+            return False
+
+        next_item = next((item for item in sorted_items if is_after(item)), None)
         if not next_item:
             self._handle_no_remaining_issues(pause_when_empty)
             return
-        self._focus_issue(next_item["frame"])
+        self._focus_issue_point(next_item.get("point", ""), next_item["frame"])
 
     def _handle_no_remaining_issues(self, pause_playback: bool) -> None:
+        self._active_issue_point = None
         self._active_issue_frame = None
         self._update_issue_selection_styles()
         self.detailed_timeline.clear_highlight()
@@ -2010,7 +2094,10 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             row = item.get("row")
             if not isinstance(row, QtWidgets.QFrame):
                 continue
-            selected = item.get("frame") == self._active_issue_frame
+            selected = (
+                item.get("point") == self._active_issue_point
+                and item.get("frame") == self._active_issue_frame
+            )
             row.setProperty("selected", bool(selected))
             row.style().unpolish(row)
             row.style().polish(row)
@@ -2027,11 +2114,15 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
     def _set_active_point(self, point_name: str) -> None:
         if point_name not in self.point_definitions:
             return
+        self._log.debug("UI: set_active_point %s", point_name)
         self.active_point = point_name
+        self._selected_marker = None
+        self.detailed_timeline.set_selected_marker(None, None)
         self._refresh_point_statuses()
         self._update_timeline_markers()
         self._update_timeline_absences()
         self._update_timeline_position(adjust_viewport=False)
+        self.setFocus()
 
     def _handle_video_click(self, x: float, y: float) -> None:
         if not self.video_player.is_loaded():
@@ -2046,6 +2137,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         if point not in self.custom_tracker.point_definitions():
             return
 
+        self._log.debug("UI: manual point click point=%s frame=%s pos=(%s,%s)", point, self.video_player.current_frame_index, x, y)
         self.custom_tracker.set_manual_point(self.video_player.current_frame_index, point, (x, y))
         self.tracking_manager.request_point(point)
         self._refresh_issue_panel()
@@ -2054,6 +2146,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._update_timeline_absences()
         self._render_current_frame()
         self._update_timeline_position()
+        self._mark_autosave_dirty()
 
     def _clear_selected_point_history(self) -> None:
         if self.active_point is None:
@@ -2066,6 +2159,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._update_timeline_markers()
         self._render_current_frame()
         self._update_timeline_position()
+        self._mark_autosave_dirty()
 
     def _mark_stop_frame(self) -> None:
         if not self.video_player.is_loaded():
@@ -2105,13 +2199,101 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._update_timeline_absences()
         if self.current_frame_bgr is not None:
             self._render_current_frame()
+        self._mark_autosave_dirty()
 
     def _jump_to_issue(self, frame_index: int) -> None:
-        self._focus_issue(frame_index)
+        point = self._active_issue_point or (self.active_point or "")
+        self._focus_issue_point(point, frame_index)
 
     # ------------------------------------------------------------------
     # Utility helpers
     # ------------------------------------------------------------------
+    def _resolve_autosave_dir(self, ensure_dir: bool = False) -> Optional[Path]:
+        base = Path(self.settings.data.default_session_folder)
+        if not base.is_absolute():
+            base = Path(self.settings_manager.path).parent / base
+        if ensure_dir:
+            try:
+                base.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                self._log.warning("UI: unable to create autosave directory %s (%s)", base, exc)
+                return None
+        return base
+
+    def _current_autosave_path(self, ensure_dir: bool = False) -> Optional[Path]:
+        video_path = self.controller.video_path
+        if video_path is None:
+            return None
+        base = self._resolve_autosave_dir(ensure_dir=ensure_dir)
+        if base is None:
+            return None
+        safe_name = video_path.stem or "autosave"
+        return base / f"{safe_name}_points.json"
+
+    def _update_auto_save_settings(self) -> None:
+        interval_sec = max(0, int(self.settings.data.auto_save_interval))
+        self._auto_save_interval_ms = interval_sec * 1000
+        self._auto_save_timer.stop()
+        if self._auto_save_interval_ms <= 0:
+            self._auto_save_dirty = False
+        elif self._auto_save_dirty:
+            self._auto_save_timer.start(200)
+
+    def _mark_autosave_dirty(self, immediate: bool = False) -> None:
+        if self._auto_save_interval_ms <= 0:
+            return
+        self._auto_save_dirty = True
+        self._auto_save_timer.stop()
+        timeout = 250 if immediate else self._auto_save_interval_ms
+        self._auto_save_timer.start(timeout)
+
+    def _perform_autosave(self) -> None:
+        if not self._auto_save_dirty or self._auto_save_interval_ms <= 0:
+            return
+        path = self._current_autosave_path(ensure_dir=True)
+        if path is None:
+            return
+        points = self.custom_tracker.serialize_state()
+        try:
+            if not points:
+                if path.exists():
+                    path.unlink()
+                self._auto_save_dirty = False
+                return
+            payload = {"version": 1, "points": points}
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            self._log.debug("UI: autosaved points -> %s", path)
+            self._auto_save_dirty = False
+        except Exception as exc:
+            self._log.warning("UI: autosave failed (%s)", exc)
+            if self._auto_save_interval_ms > 0:
+                self._auto_save_timer.start(self._auto_save_interval_ms)
+
+    def _flush_autosave(self) -> None:
+        if self._auto_save_dirty:
+            self._perform_autosave()
+        self._auto_save_timer.stop()
+
+    def _load_autosave_if_available(self) -> None:
+        path = self._current_autosave_path(ensure_dir=False)
+        if path is None or not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self._log.warning("UI: failed to read autosave %s (%s)", path, exc)
+            return
+        points = data.get("points")
+        if not isinstance(points, dict):
+            return
+        self.custom_tracker.load_state(points)
+        self._refresh_point_statuses()
+        self._update_timeline_markers()
+        self._update_timeline_absences()
+        self.tracking_manager.request_all()
+        self._auto_save_dirty = False
+        if self._auto_save_interval_ms > 0:
+            self._mark_autosave_dirty()
     def _initialize_points(self) -> None:
         self.custom_tracker.configure_points(self.point_definitions)
         if self.active_point not in self.point_definitions:
@@ -2119,6 +2301,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._refresh_point_statuses()
         self._update_timeline_absences()
         self._update_timeline_markers()
+        self._mark_autosave_dirty(immediate=False)
 
     def _on_viewport_changed(self, start: float, end: float) -> None:
         min_width = 5.0
@@ -2183,6 +2366,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self.overview_timeline.setMinimumHeight(overview_height)
         self.overview_timeline.setMaximumHeight(overview_height)
         self.custom_tracker.update_from_settings(self.settings.tracking)
+        self._update_auto_save_settings()
         default_speed = self._parse_speed_string(self.settings.playback.default_speed)
         self._set_playback_speed(default_speed, persist=False)
         self._update_timeline_position(adjust_viewport=False)
@@ -2233,6 +2417,16 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             self.overview_timeline.set_segments([])
             return
 
+        active_only = (
+            self.active_point is not None
+            and self.active_point in self.custom_tracker.point_definitions()
+        )
+        point_names: List[str]
+        if active_only:
+            point_names = [self.active_point]  # type: ignore[list-item]
+        else:
+            point_names = list(self.custom_tracker.point_definitions().keys())
+
         frame_count = self.video_player.metadata.frame_count
         max_frame = frame_count - 1 if frame_count > 0 else None
 
@@ -2255,7 +2449,10 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
                 return
             marker_records[key] = (priority, normalized)
 
-        for point_name, tracked_point in self.custom_tracker.point_definitions().items():
+        for point_name in point_names:
+            tracked_point = self.custom_tracker.point_definitions().get(point_name)
+            if not tracked_point:
+                continue
             base_color = QtGui.QColor(*tracked_point.color)
             base_color.setAlpha(235)
             auto_color = QtGui.QColor(255, 170, 60, 150)
@@ -2287,18 +2484,35 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         markers = [entry[1] for entry in sorted(marker_records.values(), key=lambda item: (item[1].frame, item[1].point_name or ""))]
         self._marker_lookup = {(marker.point_name or "", marker.frame): marker for marker in markers}
 
-        segments = self.custom_tracker.all_tracking_segments()
+        segments: List[TrackingSegment] = []
+        for point_name in point_names:
+            segments.extend(self.custom_tracker.tracking_segments(point_name))
+        segments.sort(key=lambda seg: (seg.start_key.frame, seg.end_key.frame, seg.point_name or ""))
+        self._log.debug(
+            "UI: update_timeline_markers active=%s markers=%s segments=%s",
+            self.active_point,
+            len(markers),
+            len(segments),
+        )
+
         self.detailed_timeline.set_markers(markers)
         self.overview_timeline.set_markers(markers)
         self.detailed_timeline.set_segments(segments)
         self.overview_timeline.set_segments(segments)
 
+        if self._selected_marker and self._selected_marker not in self._marker_lookup:
+            self._selected_marker = None
+
         if self._selected_marker:
-            self.detailed_timeline.set_selected_marker(self._selected_marker[0], self._selected_marker[1])
+            self.detailed_timeline.set_selected_marker(
+                self._selected_marker[0],
+                self._selected_marker[1],
+            )
         else:
             self.detailed_timeline.set_selected_marker(None, None)
 
-        self.tracking_manager.request_all()
+        for point_name in point_names:
+            self.tracking_manager.request_point(point_name)
 
     def _update_timeline_absences(self) -> None:
         ranges: List[Tuple[int, int]] = []
@@ -2330,14 +2544,37 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
         if event.key() in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace):
+            handled = False
             if self._selected_marker:
                 point_name, frame_index = self._selected_marker
                 marker = self._marker_lookup.get((point_name, frame_index))
-                if marker and marker.category == "manual" and point_name:
-                    if self.custom_tracker.delete_keyframe(point_name, frame_index):
-                        self._after_keyframe_deleted(point_name, frame_index)
-                        event.accept()
-                        return
+                if marker:
+                    target_point = marker.point_name or point_name
+                    if marker.category == "manual" and target_point:
+                        if self.custom_tracker.delete_keyframe(target_point, frame_index):
+                            self._after_keyframe_deleted(target_point, frame_index)
+                            handled = True
+                    elif marker.category in {"start", "stop"} and target_point:
+                        if self.custom_tracker.remove_absence_segment(target_point, frame_index):
+                            self._selected_marker = None
+                            self.detailed_timeline.set_selected_marker(None, None)
+                            self._after_absence_changed(target_point)
+                            handled = True
+            if not handled and self.active_point and self.video_player.is_loaded():
+                current_frame = self.video_player.current_frame_index
+                if self.custom_tracker.remove_absence_segment(self.active_point, current_frame):
+                    self._after_absence_changed(self.active_point)
+                    handled = True
+            if handled:
+                event.accept()
+                return
+        elif event.key() == QtCore.Qt.Key_S:
+            if self.active_point and self.video_player.is_loaded():
+                frame_index = self.video_player.current_frame_index
+                if self.custom_tracker.split_absence_segment(self.active_point, frame_index):
+                    self._after_absence_changed(self.active_point)
+                    event.accept()
+                    return
         super().keyPressEvent(event)
 
     def _after_keyframe_deleted(self, point_name: str, frame_index: int) -> None:
@@ -2347,6 +2584,15 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._refresh_issue_panel()
         self._update_timeline_markers()
         self._render_current_frame()
+        self._mark_autosave_dirty()
+
+    def _after_absence_changed(self, point_name: str) -> None:
+        self._refresh_point_statuses()
+        self._update_timeline_absences()
+        self._update_timeline_markers()
+        self.tracking_manager.request_point(point_name)
+        self._render_current_frame()
+        self._mark_autosave_dirty()
 
     def _close_tracking_jobs_popup(self) -> None:
         if self._tracking_jobs_popup and self._tracking_jobs_popup.isVisible():
@@ -2371,6 +2617,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self.playback_timer.stop()
+        self._flush_autosave()
         self._decoder_thread.quit()
         self._decoder_thread.wait(1500)
         self._close_tracking_jobs_popup()

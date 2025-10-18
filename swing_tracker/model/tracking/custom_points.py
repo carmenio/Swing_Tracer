@@ -4,13 +4,14 @@ from dataclasses import dataclass
 from collections import deque
 from typing import Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
 import threading
+import logging
 
 import cv2
 
 from ..entities import Point2D, TrackIssue, TrackedPoint
 from ..settings import TrackingSettings
 from .provisional import AnchorMetrics, ProvisionalChain
-from .segments import FrameSample, SegmentBuildResult, TrackingSegment
+from .segments import FrameSample, SegmentBuildResult, TrackingSegment, KeyFrame
 
 
 def _rgb_to_hex(rgb: Tuple[int, int, int]) -> str:
@@ -26,6 +27,7 @@ class CustomPointFrameResult:
 
 class CustomPointTracker:
     def __init__(self, max_history_frames: int = 200) -> None:
+        self._log = logging.getLogger(__name__)
         self.max_history_frames = max_history_frames
         self.points: Dict[str, TrackedPoint] = {}
         self.current_positions: Dict[str, Point2D] = {}
@@ -81,6 +83,106 @@ class CustomPointTracker:
         with self._frame_lock:
             self._frame_samples.clear()
             self._frame_order.clear()
+
+    def serialize_state(self) -> Dict[str, Dict[str, object]]:
+        payload: Dict[str, Dict[str, object]] = {}
+        for name, tracked_point in self.points.items():
+            if not tracked_point.keyframes:
+                continue
+            keyframes = {
+                str(frame): [float(pos[0]), float(pos[1])]
+                for frame, pos in tracked_point.keyframes.items()
+            }
+            payload[name] = {
+                "keyframes": keyframes,
+                "accepted": list(tracked_point.accepted_keyframes),
+                "absences": [[int(start), int(end)] for start, end in tracked_point.absent_ranges],
+                "open_absence": tracked_point.open_absence_start,
+            }
+        return payload
+
+    def load_state(self, data: Dict[str, Dict[str, object]]) -> None:
+        self.reset()
+        for name, payload in data.items():
+            tracked_point = self.points.get(name)
+            if not tracked_point:
+                continue
+            keyframes = payload.get("keyframes", {})
+            accepted = set(payload.get("accepted", []))
+            for frame_str, pos in keyframes.items():
+                try:
+                    frame = int(frame_str)
+                    x, y = pos
+                    tracked_point.set_keyframe(frame, (float(x), float(y)), accepted=frame in accepted)
+                except Exception:
+                    continue
+            absences = payload.get("absences", [])
+            tracked_point.clear_absence_ranges()
+            if isinstance(absences, list):
+                for entry in absences:
+                    try:
+                        start, end = int(entry[0]), int(entry[1])
+                    except Exception:
+                        continue
+                    tracked_point.add_absence(start, end)
+                    self._apply_absence_range(tracked_point, start, end)
+            open_absence = payload.get("open_absence")
+            tracked_point.open_absence_start = int(open_absence) if isinstance(open_absence, int) else None
+        self._invalidate_point_cache()
+
+    def remove_absence_segment(self, point_name: str, frame_index: int) -> bool:
+        tracked_point = self.points.get(point_name)
+        if not tracked_point:
+            return False
+
+        frame_index = int(frame_index)
+        removed = False
+        new_ranges: List[Tuple[int, int]] = []
+        for start, end in tracked_point.absent_ranges:
+            if start <= frame_index <= end or start <= frame_index - 1 <= end:
+                removed = True
+                continue
+            new_ranges.append((start, end))
+        if removed:
+            tracked_point.absent_ranges = sorted(new_ranges)
+
+        open_start = tracked_point.open_absence_start
+        if open_start is not None and frame_index >= open_start:
+            tracked_point.open_absence_start = None
+            removed = True
+
+        if removed:
+            self.current_positions.pop(point_name, None)
+            self._invalidate_point_cache(point_name)
+        return removed
+
+    def split_absence_segment(self, point_name: str, frame_index: int) -> bool:
+        tracked_point = self.points.get(point_name)
+        if not tracked_point:
+            return False
+
+        frame_index = int(frame_index)
+        for start, end in list(tracked_point.absent_ranges):
+            if start < frame_index <= end:
+                if frame_index == start:
+                    return False
+                tracked_point.absent_ranges.remove((start, end))
+                if start <= frame_index - 1:
+                    tracked_point.add_absence(start, frame_index - 1)
+                if frame_index <= end:
+                    tracked_point.add_absence(frame_index, end)
+                self.current_positions.pop(point_name, None)
+                self._invalidate_point_cache(point_name)
+                return True
+
+        open_start = tracked_point.open_absence_start
+        if open_start is not None and frame_index > open_start + 1:
+            tracked_point.add_absence(open_start + 1, frame_index - 1)
+            tracked_point.open_absence_start = frame_index
+            self.current_positions.pop(point_name, None)
+            self._invalidate_point_cache(point_name)
+            return True
+        return False
 
     def set_frame_loader(self, loader: Optional[Callable[[int], Optional[object]]]) -> None:
         """Register a callback that returns a BGR frame for the given index."""
@@ -275,7 +377,11 @@ class CustomPointTracker:
             result = self._segment_result(point_name, span, tracked_point)
             if result:
                 segments.extend(result.segments)
-        segments.sort(key=lambda segment: (segment.start_key.frame, segment.end_key.frame))
+            else:
+                fallback = self._build_fallback_segment(point_name, span, tracked_point)
+                if fallback:
+                    segments.append(fallback)
+        segments.sort(key=lambda segment: (segment.start_key.frame, segment.end_key.frame, segment.point_name or ""))
         return segments
 
     def all_tracking_segments(self) -> List[TrackingSegment]:
@@ -284,6 +390,55 @@ class CustomPointTracker:
             segments.extend(self.tracking_segments(point_name))
         segments.sort(key=lambda segment: (segment.start_key.frame, segment.end_key.frame, segment.point_name or ""))
         return segments
+
+    def _build_fallback_segment(
+        self,
+        point_name: str,
+        span: Tuple[int, int],
+        tracked_point: TrackedPoint,
+    ) -> Optional[TrackingSegment]:
+        start_frame, end_frame = span
+        if end_frame <= start_frame:
+            return None
+        start_pos = tracked_point.keyframes.get(start_frame)
+        end_pos = tracked_point.keyframes.get(end_frame)
+        if start_pos is None or end_pos is None:
+            return None
+
+        def interpolate(frame: int) -> Point2D:
+            if frame in tracked_point.positions:
+                return tracked_point.positions[frame]
+            ratio = (frame - start_frame) / (end_frame - start_frame)
+            x = start_pos[0] + (end_pos[0] - start_pos[0]) * ratio
+            y = start_pos[1] + (end_pos[1] - start_pos[1]) * ratio
+            return (x, y)
+
+        tracked_positions: Dict[int, Point2D] = {}
+        for frame in range(start_frame, end_frame + 1):
+            tracked_positions[frame] = interpolate(frame)
+
+        entity_colour = None
+        if tracked_point.color:
+            entity_colour = "#%02x%02x%02x" % tracked_point.color
+
+        gradient_colour = "#66ff00"
+        gradient_colours = {frame: gradient_colour for frame in range(start_frame, end_frame + 1)}
+
+        start_key = KeyFrame(frame=start_frame, pos=start_pos, type="confirmed", conf=1.0)
+        end_key = KeyFrame(frame=end_frame, pos=end_pos, type="confirmed", conf=1.0)
+
+        segment = TrackingSegment(
+            start_key=start_key,
+            end_key=end_key,
+            tracked_positions=tracked_positions,
+            residuals={},
+            gradient_colours=gradient_colours,
+            provisional_points=[],
+            accepted=False,
+            entity_colour=entity_colour,
+        )
+        segment.point_name = point_name
+        return segment
 
     def span_pairs(self, point_name: str) -> List[Tuple[int, int]]:
         tracked_point = self.points.get(point_name)
@@ -323,8 +478,15 @@ class CustomPointTracker:
         if result is None:
             # Leave the span dirty so the manager can retry later.
             self._mark_span_dirty(point_name, span)
+            self._log.debug("apply_segment_result: missing result point=%s span=%s", point_name, span)
             return
 
+        self._log.debug(
+            "apply_segment_result: point=%s span=%s positions=%d",
+            point_name,
+            span,
+            len(result.optical_flow.positions),
+        )
         for frame_index, position in result.optical_flow.positions.items():
             if frame_index in tracked_point.keyframes:
                 continue
@@ -342,6 +504,12 @@ class CustomPointTracker:
         result_map = self._segment_results.setdefault(point_name, {})
         result_map[span] = result
         self._segment_dirty.setdefault(point_name, set()).discard(span)
+        self._log.debug(
+            "apply_segment_result: stored point=%s span=%s segments=%d",
+            point_name,
+            span,
+            len(result.segments),
+        )
 
 
     def accept_provisional(self, point_name: str, span: Tuple[int, int], frame: int) -> bool:
@@ -448,20 +616,27 @@ class CustomPointTracker:
         )
 
     def set_manual_point(self, frame_index: int, point_name: str, position: Point2D) -> None:
+        self._log.debug(
+            "set_manual_point start point=%s frame=%s position=%s", point_name, frame_index, position
+        )
         tracked_point = self.points[point_name]
         was_absent = tracked_point.is_absent(frame_index)
         open_start = tracked_point.open_absence_start
         tracked_point.remove_absence_at(frame_index)
         if was_absent and (open_start is None or frame_index < open_start):
             tracked_point.end_absence_at(frame_index)
-        if self.truncate_future_on_manual_set:
-            tracked_point.truncate_after(frame_index)
         tracked_point.set_keyframe(frame_index, position, accepted=True)
         self._interpolate_neighbors(tracked_point, frame_index)
         tracked_point.smoothed_position = position
         tracked_point.last_frame_index = frame_index
         self.current_positions[point_name] = position
         self._invalidate_point_cache(point_name)
+        self._log.debug(
+            "set_manual_point complete point=%s frame=%s total_keyframes=%s",
+            point_name,
+            frame_index,
+            len(tracked_point.keyframes),
+        )
 
     def clear_point_history(self, point_name: str) -> None:
         if point_name not in self.points:
@@ -520,7 +695,6 @@ class CustomPointTracker:
         if current_start is None:
             tracked_point.open_absence_start = frame_index
             tracked_point.remove_absence_at(frame_index)
-            tracked_point.truncate_after(frame_index - 1)
             self.current_positions.pop(point_name, None)
             self._invalidate_point_cache(point_name)
             return True

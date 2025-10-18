@@ -41,6 +41,7 @@ class SwingTrackerModel:
         )
         self._tracking_capture: Optional[cv2.VideoCapture] = None
         self._tracking_capture_lock = threading.RLock()
+        self._video_path: Optional[Path] = None
 
     def set_active_point(self, point_name: Optional[str]) -> None:
         self.active_point = point_name
@@ -53,6 +54,7 @@ class SwingTrackerModel:
             if self._tracking_capture is not None:
                 self._tracking_capture.release()
                 self._tracking_capture = None
+            self._video_path = None
 
             if path is None:
                 return
@@ -68,6 +70,7 @@ class SwingTrackerModel:
                 pass
 
             self._tracking_capture = capture
+            self._video_path = Path(path)
 
     def _fetch_tracking_frame(self, frame_index: int):
         with self._tracking_capture_lock:
@@ -81,3 +84,7 @@ class SwingTrackerModel:
             if not success or frame is None:
                 return None
             return frame.copy()
+
+    @property
+    def video_path(self) -> Optional[Path]:
+        return self._video_path

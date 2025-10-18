@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from typing import Callable, Dict, List, Optional, Set, Tuple
+import logging
 
 from PyQt5 import QtCore
 
@@ -77,6 +78,7 @@ class TrackingWorker(QtCore.QThread):
         super().__init__(parent)
         self._config = config
         self._tracker = tracker
+        self._log = logging.getLogger(__name__)
 
     def run(self) -> None:  # pragma: no cover - runs in background thread
         span_start, span_end = self._config.span
@@ -94,6 +96,14 @@ class TrackingWorker(QtCore.QThread):
         preload_weight = max(0.0, min(1.0, self._config.preload_weight))
         compute_weight = 1.0 - preload_weight
 
+        self._log.debug(
+            "TrackingWorker[%s]: start point=%s span=%s preload=%.2f", 
+            self._config.job_id,
+            self._config.point_name,
+            self._config.span,
+            preload_weight,
+        )
+
         try:
             for index, frame_index in enumerate(range(span_start, span_end + 1)):
                 if self.isInterruptionRequested():
@@ -102,6 +112,9 @@ class TrackingWorker(QtCore.QThread):
                 if sample is None:
                     frame_bgr = loader(frame_index)
                     if frame_bgr is None:
+                        self._log.debug(
+                            "TrackingWorker[%s]: missing frame %s", self._config.job_id, frame_index
+                        )
                         self.failed_signal.emit(
                             self._config.job_id,
                             f"Unable to load frame {frame_index} for tracking.",
@@ -157,17 +170,21 @@ class TrackingWorker(QtCore.QThread):
                 progress_callback=on_progress if compute_weight > 0.0 else None,
             )
         except InterruptedError:
+            self._log.debug("TrackingWorker[%s]: interrupted", self._config.job_id)
             return
         except Exception as exc:  # pragma: no cover - defensive
+            self._log.exception("TrackingWorker[%s]: error", self._config.job_id)
             self.failed_signal.emit(self._config.job_id, str(exc))
             return
 
         if result is None:
+            self._log.debug("TrackingWorker[%s]: result missing", self._config.job_id)
             self.failed_signal.emit(self._config.job_id, "Tracking failed to produce a result.")
             return
 
         self.progress_signal.emit(self._config.job_id, 1.0)
         self.result_signal.emit(self._config.job_id, result)
+        self._log.debug("TrackingWorker[%s]: finished", self._config.job_id)
 
 
 class TrackingManager(QtCore.QObject):
@@ -183,12 +200,14 @@ class TrackingManager(QtCore.QObject):
     def __init__(self, tracker: CustomPointTracker, parent: Optional[QtCore.QObject] = None) -> None:
         super().__init__(parent)
         self._tracker = tracker
+        self._log = logging.getLogger(__name__)
         self._jobs: Dict[int, ActiveJob] = {}
         self._job_states: Dict[int, TrackingJobState] = {}
         self._paused_jobs: Dict[int, TrackingJobConfig] = {}
         self._span_to_job: Dict[Tuple[str, Tuple[int, int]], int] = {}
         self._next_job_id: int = 1
         self._shutting_down: bool = False
+        self._active_workers: Dict[int, TrackingWorker] = {}
 
     def request_point(self, point_name: Optional[str]) -> None:
         if not point_name:
@@ -209,6 +228,7 @@ class TrackingManager(QtCore.QObject):
             if config is None:
                 continue
             self._next_job_id += 1
+            self._log.debug("TrackingManager: queue point=%s span=%s job=%s", point_name, span, job_id)
             self._start_job(config)
 
     def request_all(self) -> None:
@@ -216,12 +236,18 @@ class TrackingManager(QtCore.QObject):
             self.request_point(point_name)
 
     def reset(self) -> None:
+        self._log.debug("TrackingManager: reset requested (active=%s)", len(self._jobs))
         running = list(self._jobs.values())
         self._shutting_down = True
         for job in running:
             job.worker.requestInterruption()
         for job in running:
-            job.worker.wait(1000)
+            if not job.worker.wait(5000):
+                self._log.debug("TrackingManager: terminating slow job=%s", job.config.job_id)
+                job.worker.terminate()
+                job.worker.wait()
+            job.worker.deleteLater()
+            self._active_workers.pop(job.config.job_id, None)
         self._jobs.clear()
         self._span_to_job.clear()
         self._paused_jobs.clear()
@@ -247,9 +273,11 @@ class TrackingManager(QtCore.QObject):
         self._jobs.pop(job_id, None)
         self._span_to_job.pop((job.config.point_name, job.config.span), None)
         self._paused_jobs[job_id] = job.config
+        self._active_workers.pop(job_id, None)
         job.state.status = "Paused"
         self.job_updated.emit(replace(job.state))
         self._emit_overall_progress()
+        self._log.debug("TrackingManager: paused job=%s", job_id)
         return True
 
     def resume_job(self, job_id: int) -> bool:
@@ -261,6 +289,7 @@ class TrackingManager(QtCore.QObject):
             state.progress = 0.0
             state.message = ""
         self._start_job(config)
+        self._log.debug("TrackingManager: resumed job=%s", job_id)
         return True
 
     def cancel_job(self, job_id: int) -> bool:
@@ -273,6 +302,7 @@ class TrackingManager(QtCore.QObject):
             job.worker.wait(1000)
             self._span_to_job.pop((job.config.point_name, job.config.span), None)
             state = job.state
+            self._active_workers.pop(job_id, None)
         else:
             state = self._job_states.get(job_id)
         if state is not None:
@@ -281,6 +311,7 @@ class TrackingManager(QtCore.QObject):
             state.message = ""
             self.job_updated.emit(replace(state))
         self._emit_overall_progress()
+        self._log.debug("TrackingManager: cancelled job=%s", job_id)
         return True
 
     def job_states(self) -> Dict[int, TrackingJobState]:
@@ -358,11 +389,13 @@ class TrackingManager(QtCore.QObject):
         job = ActiveJob(config=config, worker=worker, state=state)
         self._jobs[config.job_id] = job
         self._span_to_job[(config.point_name, config.span)] = config.job_id
+        self._active_workers[config.job_id] = worker
 
         worker.progress_signal.connect(self._on_worker_progress)
         worker.result_signal.connect(self._on_worker_result)
         worker.failed_signal.connect(self._on_worker_failed)
         worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(lambda job_id=config.job_id: self._on_worker_thread_finished(job_id))
 
         if len(self._jobs) == 1:
             self.tracking_started.emit()
@@ -373,6 +406,18 @@ class TrackingManager(QtCore.QObject):
         if priority is not None:
             worker.setPriority(priority)
         (self.job_registered if is_new else self.job_updated).emit(replace(state))
+        self._log.debug(
+            "TrackingManager: started job=%s point=%s span=%s active_jobs=%s",
+            config.job_id,
+            config.point_name,
+            config.span,
+            len(self._jobs),
+        )
+
+    def _on_worker_thread_finished(self, job_id: int) -> None:
+        worker = self._active_workers.pop(job_id, None)
+        if worker:
+            self._log.debug("TrackingManager: worker finished job=%s", job_id)
 
     def _priority_value(self, config: TrackingJobConfig) -> Optional[QtCore.QThread.Priority]:
         mode = (config.performance_mode or "").lower()
@@ -414,6 +459,9 @@ class TrackingManager(QtCore.QObject):
         else:
             self.segment_failed.emit(job.config.point_name, job.config.span, "Tracking produced no result.")
             self._finalise_job(job_id, status="Failed")
+        self._log.debug(
+            "TrackingManager: job %s result=%s", job_id, "ok" if result is not None else "empty"
+        )
 
     @QtCore.pyqtSlot(int, str)
     def _on_worker_failed(self, job_id: int, message: str) -> None:
@@ -423,6 +471,7 @@ class TrackingManager(QtCore.QObject):
         if state is not None:
             self.segment_failed.emit(state.point_name, state.span, message)
         self._finalise_job(job_id, status="Failed", message=message)
+        self._log.debug("TrackingManager: job %s failed %s", job_id, message)
 
     def _finalise_job(self, job_id: int, *, status: str, message: Optional[str] = None, progress: Optional[float] = None) -> None:
         job = self._jobs.pop(job_id, None)
@@ -435,10 +484,29 @@ class TrackingManager(QtCore.QObject):
             state.progress = max(0.0, min(1.0, progress))
         state.status = status
         state.message = message or ""
-        self.job_updated.emit(replace(state))
+
+        if status in {"Completed", "Failed", "Cancelled"}:
+            self._job_states.pop(job_id, None)
+            self.job_removed.emit(job_id)
+        else:
+            self.job_updated.emit(replace(state))
+
+        worker = self._active_workers.pop(job_id, None)
+        if worker is not None:
+            if not worker.wait(5000):
+                self._log.debug("TrackingManager: finalise terminate job=%s", job_id)
+                worker.terminate()
+                worker.wait()
+
         self._emit_overall_progress()
         if not self._jobs and not self._shutting_down:
             self.tracking_finished.emit()
+        self._log.debug(
+            "TrackingManager: finalised job=%s status=%s remaining=%s",
+            job_id,
+            status,
+            len(self._jobs),
+        )
 
     def _emit_overall_progress(self) -> None:
         if self._jobs:
