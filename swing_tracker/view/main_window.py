@@ -2,6 +2,7 @@ from bisect import bisect_left
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 import logging
 import json
+import copy
 
 from pathlib import Path
 
@@ -18,6 +19,34 @@ from .timeline import DetailedTimeline, OverviewTimeline, TimelineMarker, clamp
 
 if TYPE_CHECKING:  # pragma: no cover - for static analysis only
     from ..controller import SwingTrackerController
+
+
+class UndoManager:
+    def __init__(self, capacity: int = 64) -> None:
+        self._capacity = max(1, capacity)
+        self._stack: List[Dict[str, Any]] = []
+
+    def push(self, snapshot: Dict[str, Any]) -> None:
+        if not snapshot:
+            return
+        self._stack.append(snapshot)
+        if len(self._stack) > self._capacity:
+            self._stack.pop(0)
+
+    def pop(self) -> Optional[Dict[str, Any]]:
+        if not self._stack:
+            return None
+        return self._stack.pop()
+
+    def discard_last(self) -> None:
+        if self._stack:
+            self._stack.pop()
+
+    def clear(self) -> None:
+        self._stack.clear()
+
+    def can_undo(self) -> bool:
+        return bool(self._stack)
 
 
 class FrameDecodeWorker(QtCore.QObject):
@@ -518,6 +547,11 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
 
         self.issues_collapsed: bool = False
+        self._undo_manager = UndoManager()
+        self._undo_block: bool = False
+        self._undo_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence.Undo, self)
+        self._undo_shortcut.setContext(QtCore.Qt.ApplicationShortcut)
+        self._undo_shortcut.activated.connect(self._undo_last_action)
 
         self._speed_actions: List[QtWidgets.QAction] = []
         self._build_ui()
@@ -1324,6 +1358,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self.tracking_manager.reset()
         self._job_states.clear()
         self._update_tracking_jobs_popup()
+        self._undo_manager.clear()
 
         self.controller.set_tracking_video_path(Path(file_path))
         self._update_auto_save_settings()
@@ -1390,6 +1425,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
     def stop_playback(self) -> None:
         if not self.video_player.is_loaded():
             return
+        self._undo_manager.clear()
         self._flush_autosave()
         self.playback_timer.stop()
         self._update_play_button(False)
@@ -2033,36 +2069,48 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         return row, metadata
 
     def _accept_provisional_candidate(self, point_name: str, span: Tuple[int, int], frame_index: int) -> None:
+        snapshot_added = self._record_undo_state("Accept provisional")
         if self.custom_tracker.accept_provisional(point_name, span, frame_index):
             self.tracking_manager.request_point(point_name)
             self._update_timeline_markers()
             self._refresh_issue_panel()
             self._advance_to_next_issue(frame_index, point_name)
             self._mark_autosave_dirty()
+        elif snapshot_added:
+            self._undo_manager.discard_last()
 
     def _reject_provisional_candidate(self, point_name: str, span: Tuple[int, int], frame_index: int) -> None:
+        snapshot_added = self._record_undo_state("Reject provisional")
         if self.custom_tracker.reject_provisional(point_name, span, frame_index):
             self.tracking_manager.request_point(point_name)
             self._update_timeline_markers()
             self._refresh_issue_panel()
             self._advance_to_next_issue(frame_index, point_name, pause_when_empty=True)
             self._mark_autosave_dirty()
+        elif snapshot_added:
+            self._undo_manager.discard_last()
 
     def _accept_all_provisionals(self, point_name: str, span: Tuple[int, int]) -> None:
+        snapshot_added = self._record_undo_state("Accept all provisional")
         if self.custom_tracker.accept_all_provisionals(point_name, span):
             self.tracking_manager.request_point(point_name)
             self._update_timeline_markers()
             self._refresh_issue_panel()
             self._advance_to_next_issue(-1, None)
             self._mark_autosave_dirty()
+        elif snapshot_added:
+            self._undo_manager.discard_last()
 
     def _reject_all_provisionals(self, point_name: str, span: Tuple[int, int]) -> None:
+        snapshot_added = self._record_undo_state("Reject all provisional")
         if self.custom_tracker.reject_all_provisionals(point_name, span):
             self.tracking_manager.request_point(point_name)
             self._update_timeline_markers()
             self._refresh_issue_panel()
             self._advance_to_next_issue(-1, None, pause_when_empty=True)
             self._mark_autosave_dirty()
+        elif snapshot_added:
+            self._undo_manager.discard_last()
 
     def _focus_issue_point(self, point_name: str, frame_index: int) -> None:
         if not self.video_player.is_loaded():
@@ -2169,6 +2217,7 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         if point not in self.custom_tracker.point_definitions():
             return
 
+        self._record_undo_state("Set point")
         self._log.debug("UI: manual point click point=%s frame=%s pos=(%s,%s)", point, self.video_player.current_frame_index, x, y)
         self.custom_tracker.set_manual_point(self.video_player.current_frame_index, point, (x, y))
         self.tracking_manager.request_point(point)
@@ -2193,11 +2242,79 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         target_frame = self.video_player.current_frame_index + frames_to_jump
         self.seek_to_frame(target_frame, resume_playback=False)
 
+    # ------------------------------------------------------------------
+    # Undo helpers
+    # ------------------------------------------------------------------
+    def _record_undo_state(self, label: str) -> bool:
+        if self._undo_block or not self.video_player.is_loaded():
+            return False
+        snapshot = {
+            "label": label,
+            "points": copy.deepcopy(self.custom_tracker.serialize_state()),
+            "active_point": self.active_point,
+            "frame": self.video_player.current_frame_index,
+            "viewport_range": tuple(self.viewport_range),
+            "selected_marker": self._selected_marker,
+            "issue_point": self._active_issue_point,
+            "issue_frame": self._active_issue_frame,
+        }
+        self._undo_manager.push(snapshot)
+        return True
+
+    def _undo_last_action(self) -> None:
+        if self._undo_block:
+            return
+        snapshot = self._undo_manager.pop()
+        if not snapshot:
+            return
+        if not self.video_player.is_loaded():
+            # Restore snapshot for later if no video is loaded.
+            self._undo_manager.push(snapshot)
+            return
+
+        self._undo_block = True
+        try:
+            self.tracking_manager.reset()
+            points_state = snapshot.get("points") or {}
+            self.custom_tracker.load_state(copy.deepcopy(points_state))
+            restored_active = snapshot.get("active_point")
+            if restored_active and restored_active not in self.point_definitions:
+                restored_active = None
+            self.active_point = restored_active
+            target_frame = snapshot.get("frame", self.video_player.current_frame_index)
+            restored_view = tuple(snapshot.get("viewport_range", self.viewport_range))
+            self.viewport_range = restored_view
+            self.detailed_timeline.set_viewport_range(*self.viewport_range)
+            self.overview_timeline.set_viewport_range(*self.viewport_range)
+            self._selected_marker = snapshot.get("selected_marker")
+            self._active_issue_point = snapshot.get("issue_point")
+            self._active_issue_frame = snapshot.get("issue_frame")
+        finally:
+            self._undo_block = False
+
+        self.seek_to_frame(target_frame, resume_playback=False)
+
+        if self._selected_marker:
+            marker_point, marker_frame = self._selected_marker
+            self.detailed_timeline.set_selected_marker(marker_point or None, marker_frame)
+        else:
+            self.detailed_timeline.set_selected_marker(None, None)
+
+        self._refresh_point_statuses()
+        self._update_timeline_markers()
+        self._update_timeline_absences()
+        self._refresh_issue_panel()
+        self._update_mark_stop_button_state()
+        self._update_issue_selection_styles()
+        self._update_timeline_position(adjust_viewport=False)
+        self._mark_autosave_dirty()
+
     def _clear_selected_point_history(self) -> None:
         if self.active_point is None:
             return
         if self.active_point not in self.custom_tracker.point_definitions():
             return
+        self._record_undo_state("Clear point history")
         self.custom_tracker.clear_point_history(self.active_point)
         self._refresh_issue_panel()
         self._refresh_point_statuses()
@@ -2231,7 +2348,10 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             return
 
         total_frames = self.video_player.metadata.frame_count if self.video_player.is_loaded() else frame_index + 1
+        snapshot_added = self._record_undo_state("Toggle off-frame")
         if not self.custom_tracker.mark_stop_frame(self.active_point, frame_index, total_frames):
+            if snapshot_added:
+                self._undo_manager.discard_last()
             QtWidgets.QMessageBox.information(
                 self,
                 "Unable to Update",
@@ -2253,12 +2373,18 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         if not tracked_point:
             return
         new_value = not tracked_point.occluded
+        snapshot_added = self._record_undo_state("Toggle occluded")
         if not self.custom_tracker.set_point_occluded(self.active_point, new_value):
+            if snapshot_added:
+                self._undo_manager.discard_last()
             return
         self._log.debug("UI: toggle_occluded point=%s value=%s", self.active_point, new_value)
         self._refresh_point_statuses()
         if self.current_frame_bgr is not None:
             self._render_current_frame()
+        self._update_timeline_markers()
+        self._update_timeline_absences()
+        self._update_mark_stop_button_state()
         self._refresh_issue_panel()
         self._mark_autosave_dirty()
 
@@ -2671,30 +2797,42 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
                 if marker:
                     target_point = marker.point_name or point_name
                     if marker.category == "manual" and target_point:
+                        snapshot_added = self._record_undo_state("Delete keyframe")
                         if self.custom_tracker.delete_keyframe(target_point, frame_index):
                             self._after_keyframe_deleted(target_point, frame_index)
                             handled = True
+                        elif snapshot_added:
+                            self._undo_manager.discard_last()
                     elif marker.category in {"start", "stop"} and target_point:
+                        snapshot_added = self._record_undo_state("Remove stop frame")
                         if self.custom_tracker.remove_absence_segment(target_point, frame_index):
                             self._selected_marker = None
                             self.detailed_timeline.set_selected_marker(None, None)
                             self._after_absence_changed(target_point)
                             handled = True
+                        elif snapshot_added:
+                            self._undo_manager.discard_last()
             if not handled and self.active_point and self.video_player.is_loaded():
                 current_frame = self.video_player.current_frame_index
+                snapshot_added = self._record_undo_state("Remove stop frame")
                 if self.custom_tracker.remove_absence_segment(self.active_point, current_frame):
                     self._after_absence_changed(self.active_point)
                     handled = True
+                elif snapshot_added:
+                    self._undo_manager.discard_last()
             if handled:
                 event.accept()
                 return
         elif event.key() == QtCore.Qt.Key_S:
             if self.active_point and self.video_player.is_loaded():
                 frame_index = self.video_player.current_frame_index
+                snapshot_added = self._record_undo_state("Split stop frame")
                 if self.custom_tracker.split_absence_segment(self.active_point, frame_index):
                     self._after_absence_changed(self.active_point)
                     event.accept()
                     return
+                elif snapshot_added:
+                    self._undo_manager.discard_last()
         super().keyPressEvent(event)
 
     def _after_keyframe_deleted(self, point_name: str, frame_index: int) -> None:

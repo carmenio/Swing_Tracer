@@ -89,7 +89,12 @@ class CustomPointTracker:
     def serialize_state(self) -> Dict[str, Dict[str, object]]:
         payload: Dict[str, Dict[str, object]] = {}
         for name, tracked_point in self.points.items():
-            if not tracked_point.keyframes:
+            if (
+                not tracked_point.keyframes
+                and not tracked_point.absent_ranges
+                and tracked_point.open_absence_start is None
+                and not tracked_point.occluded
+            ):
                 continue
             keyframes = {
                 str(frame): [float(pos[0]), float(pos[1])]
