@@ -25,18 +25,33 @@ class UndoManager:
     def __init__(self, capacity: int = 64) -> None:
         self._capacity = max(1, capacity)
         self._stack: List[Dict[str, Any]] = []
+        self._redo_stack: List[Dict[str, Any]] = []
 
-    def push(self, snapshot: Dict[str, Any]) -> None:
+    def push(self, snapshot: Dict[str, Any], *, clear_redo: bool = True) -> None:   
         if not snapshot:
             return
         self._stack.append(snapshot)
         if len(self._stack) > self._capacity:
             self._stack.pop(0)
+        if clear_redo:
+            self._redo_stack.clear()
 
     def pop(self) -> Optional[Dict[str, Any]]:
         if not self._stack:
             return None
         return self._stack.pop()
+
+    def push_redo(self, snapshot: Dict[str, Any]) -> None:
+        if not snapshot:
+            return
+        self._redo_stack.append(snapshot)
+        if len(self._redo_stack) > self._capacity:
+            self._redo_stack.pop(0)
+
+    def pop_redo(self) -> Optional[Dict[str, Any]]:
+        if not self._redo_stack:
+            return None
+        return self._redo_stack.pop()
 
     def discard_last(self) -> None:
         if self._stack:
@@ -44,6 +59,10 @@ class UndoManager:
 
     def clear(self) -> None:
         self._stack.clear()
+        self._redo_stack.clear()
+    
+    def can_redo(self) -> bool:
+        return bool(self._redo_stack)
 
     def can_undo(self) -> bool:
         return bool(self._stack)
@@ -552,6 +571,10 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._undo_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence.Undo, self)
         self._undo_shortcut.setContext(QtCore.Qt.ApplicationShortcut)
         self._undo_shortcut.activated.connect(self._undo_last_action)
+        self._redo_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence.Redo, self)
+        self._redo_shortcut.setContext(QtCore.Qt.ApplicationShortcut)
+        self._redo_shortcut.activated.connect(self._redo_last_action)
+
 
         self._speed_actions: List[QtWidgets.QAction] = []
         self._build_ui()
@@ -2253,10 +2276,8 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
     # Undo helpers
     # ------------------------------------------------------------------
-    def _record_undo_state(self, label: str) -> bool:
-        if self._undo_block or not self.video_player.is_loaded():
-            return False
-        snapshot = {
+    def _create_state_snapshot(self, label: str) -> Dict[str, Any]:
+        return {
             "label": label,
             "points": copy.deepcopy(self.custom_tracker.serialize_state()),
             "active_point": self.active_point,
@@ -2266,39 +2287,30 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
             "issue_point": self._active_issue_point,
             "issue_frame": self._active_issue_frame,
         }
+        
+    def _record_undo_state(self, label: str) -> bool:
+        if self._undo_block or not self.video_player.is_loaded():
+            return False
+        snapshot = self._create_state_snapshot(label)
         self._undo_manager.push(snapshot)
         return True
 
-    def _undo_last_action(self) -> None:
-        if self._undo_block:
-            return
-        snapshot = self._undo_manager.pop()
-        if not snapshot:
-            return
-        if not self.video_player.is_loaded():
-            # Restore snapshot for later if no video is loaded.
-            self._undo_manager.push(snapshot)
-            return
-
-        self._undo_block = True
-        try:
-            self.tracking_manager.reset()
-            points_state = snapshot.get("points") or {}
-            self.custom_tracker.load_state(copy.deepcopy(points_state))
-            restored_active = snapshot.get("active_point")
-            if restored_active and restored_active not in self.point_definitions:
-                restored_active = None
-            self.active_point = restored_active
-            target_frame = snapshot.get("frame", self.video_player.current_frame_index)
-            restored_view = tuple(snapshot.get("viewport_range", self.viewport_range))
-            self.viewport_range = restored_view
-            self.detailed_timeline.set_viewport_range(*self.viewport_range)
-            self.overview_timeline.set_viewport_range(*self.viewport_range)
-            self._selected_marker = snapshot.get("selected_marker")
-            self._active_issue_point = snapshot.get("issue_point")
-            self._active_issue_frame = snapshot.get("issue_frame")
-        finally:
-            self._undo_block = False
+    def _apply_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        self.tracking_manager.reset()
+        points_state = snapshot.get("points") or {}
+        self.custom_tracker.load_state(copy.deepcopy(points_state))
+        restored_active = snapshot.get("active_point")
+        if restored_active and restored_active not in self.point_definitions:
+            restored_active = None
+        self.active_point = restored_active
+        target_frame = snapshot.get("frame", self.video_player.current_frame_index)
+        restored_view = tuple(snapshot.get("viewport_range", self.viewport_range))
+        self.viewport_range = restored_view
+        self.detailed_timeline.set_viewport_range(*self.viewport_range)
+        self.overview_timeline.set_viewport_range(*self.viewport_range)
+        self._selected_marker = snapshot.get("selected_marker")
+        self._active_issue_point = snapshot.get("issue_point")
+        self._active_issue_frame = snapshot.get("issue_frame")
 
         self.seek_to_frame(target_frame, resume_playback=False)
 
@@ -2316,6 +2328,46 @@ class SwingTrackerWindow(QtWidgets.QMainWindow):
         self._update_issue_selection_styles()
         self._update_timeline_position(adjust_viewport=False)
         self._mark_autosave_dirty()
+
+
+    def _undo_last_action(self) -> None:
+        if self._undo_block:
+            return
+        snapshot = self._undo_manager.pop()
+        if not snapshot:
+            return
+        if not self.video_player.is_loaded():
+            # Restore snapshot for later if no video is loaded.
+            self._undo_manager.push(snapshot)
+            return
+
+        current_state = self._create_state_snapshot("Redo anchor")
+        self._undo_manager.push_redo(current_state)
+
+        self._undo_block = True
+        try:
+            self._apply_snapshot(snapshot)
+        finally:
+            self._undo_block = False
+
+    def _redo_last_action(self) -> None:
+        if self._undo_block:
+            return
+        snapshot = self._undo_manager.pop_redo()
+        if not snapshot:
+            return
+        if not self.video_player.is_loaded():
+            self._undo_manager.push_redo(snapshot)
+            return
+
+        current_state = self._create_state_snapshot("Undo anchor")
+        self._undo_manager.push(current_state, clear_redo=False)
+
+        self._undo_block = True
+        try:
+            self._apply_snapshot(snapshot)
+        finally:
+            self._undo_block = False
 
     def _clear_selected_point_history(self) -> None:
         if self.active_point is None:
